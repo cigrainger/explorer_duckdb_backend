@@ -177,6 +177,60 @@ defmodule ExplorerDuckDB do
   def current_db, do: Shared.get_db()
 
   @doc """
+  Show the SQL that would be generated for a lazy DataFrame pipeline.
+  Does NOT execute the query.
+
+  ## Examples
+
+      df = DataFrame.new(x: [1, 2, 3])
+      lazy =
+        df
+        |> DataFrame.lazy()
+        |> DataFrame.filter(x > 1)
+        |> DataFrame.sort_by(asc: x)
+
+      ExplorerDuckDB.sql_preview(lazy)
+      # => "WITH __s0 AS (SELECT * FROM __explorer_c1_... WHERE ...),
+      #          __s1 AS (SELECT * FROM __s0 ORDER BY ...)
+      #     SELECT * FROM __s1"
+  """
+  def sql_preview(%Explorer.DataFrame{data: %ExplorerDuckDB.LazyFrame{} = lazy}) do
+    ExplorerDuckDB.QueryBuilder.build(lazy.source, lazy.operations)
+  end
+
+  def sql_preview(%Explorer.DataFrame{} = df) do
+    "-- Eager DataFrame (no pending operations)\n-- Source: NIF resource #{inspect(df.data.resource)}"
+  end
+
+  @doc """
+  Run EXPLAIN on a SQL query and return the query plan as a string.
+
+  ## Examples
+
+      ExplorerDuckDB.explain("SELECT * FROM generate_series(1, 100) t(x) WHERE x > 50")
+  """
+  def explain(sql) when is_binary(sql) do
+    db = Shared.get_db()
+
+    case Native.df_query(db, "EXPLAIN #{sql}") do
+      {:ok, ref} ->
+        case Native.df_to_rows(ref) do
+          {:ok, rows} -> rows |> Enum.map_join("\n", &(&1 |> Map.values() |> Enum.join(" ")))
+          rows when is_list(rows) -> rows |> Enum.map_join("\n", &(&1 |> Map.values() |> Enum.join(" ")))
+        end
+
+      ref when is_reference(ref) ->
+        case Native.df_to_rows(ref) do
+          {:ok, rows} -> rows |> Enum.map_join("\n", &(&1 |> Map.values() |> Enum.join(" ")))
+          rows when is_list(rows) -> rows |> Enum.map_join("\n", &(&1 |> Map.values() |> Enum.join(" ")))
+        end
+
+      {:error, error} ->
+        "EXPLAIN error: #{error}"
+    end
+  end
+
+  @doc """
   Execute a SQL query and stream results as a sequence of DataFrames.
   Each element is a batch of rows (typically 2048, DuckDB's vector size).
 
