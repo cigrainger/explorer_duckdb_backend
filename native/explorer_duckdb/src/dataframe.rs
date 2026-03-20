@@ -341,66 +341,61 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
             .execute(params)
             .map_err(DuckDBExError::DuckDB)?;
     } else {
-        // For >2048 rows: chunk into 2048-row Arrow vtab inserts
-        let _ = conn.register_table_function::<ArrowVTab>("arrow");
-
-        // Concatenate all batches first
-        let all_arrays: Vec<_> = (0..schema.fields().len())
-            .map(|col_idx| {
-                let arrays: Vec<&dyn duckdb::arrow::array::Array> = df
-                    .resource.batches.iter()
-                    .map(|b| b.column(col_idx).as_ref())
-                    .collect();
-                duckdb::arrow::compute::concat(&arrays).unwrap()
-            })
-            .collect();
-
-        let combined = RecordBatch::try_new(schema.clone(), all_arrays)
-            .map_err(|e| DuckDBExError::Other(format!("concat: {e}")))?;
-
-        // Create the table from the first chunk
-        let chunk_size = 2048;
-        let first_chunk_len = std::cmp::min(chunk_size, total_rows);
-        let first_chunk = combined.slice(0, first_chunk_len);
-
-        let params = arrow_recordbatch_to_query_params(first_chunk);
-        let sql = format!(
-            "CREATE TEMPORARY TABLE {table_name} AS \
-             SELECT {rowid_prefix}* FROM arrow($1, $2)"
-        );
-        conn.prepare(&sql)
-            .map_err(DuckDBExError::DuckDB)?
-            .execute(params)
+        // For >2048 rows: use Appender::append_record_batch
+        // The Appender handles chunking automatically (vector_size batches)
+        let mut col_defs: Vec<String> = if has_rowid { vec![] } else { vec!["__rowid BIGINT".to_string()] };
+        for field in schema.fields() {
+            col_defs.push(format!("\"{}\" {}", field.name(), arrow_type_to_duckdb_sql(field.data_type())));
+        }
+        conn.execute_batch(&format!("CREATE TEMPORARY TABLE {table_name} ({})", col_defs.join(", ")))
             .map_err(DuckDBExError::DuckDB)?;
 
-        // Insert remaining chunks
-        let mut offset = chunk_size;
-        while offset < total_rows {
-            let len = std::cmp::min(chunk_size, total_rows - offset);
-            let chunk = combined.slice(offset, len);
-            let params = arrow_recordbatch_to_query_params(chunk);
-
-            let col_names: Vec<String> = schema.fields().iter()
-                .filter(|f| f.name() != "__rowid")
-                .map(|f| format!("\"{}\"", f.name()))
-                .collect();
-
-            let insert_sql = if has_rowid {
-                format!("INSERT INTO {table_name} SELECT * FROM arrow($1, $2)")
-            } else {
-                format!(
-                    "INSERT INTO {table_name} SELECT {} + ROW_NUMBER() OVER () - 1 AS __rowid, {} FROM arrow($1, $2)",
-                    offset,
-                    col_names.join(", ")
-                )
-            };
-
-            conn.prepare(&insert_sql)
-                .map_err(DuckDBExError::DuckDB)?
-                .execute(params)
+        if has_rowid {
+            // Data already has __rowid, append directly
+            let mut appender = conn.appender(&table_name)
                 .map_err(DuckDBExError::DuckDB)?;
 
-            offset += chunk_size;
+            for batch in &df.resource.batches {
+                appender.append_record_batch(batch.clone())
+                    .map_err(DuckDBExError::DuckDB)?;
+            }
+            appender.flush().map_err(DuckDBExError::DuckDB)?;
+        } else {
+            // Need to add __rowid column -- append data first, then add __rowid
+            // Create temp table without __rowid, append, then ALTER to add it
+            let data_table = format!("{table_name}_data");
+            let mut data_col_defs: Vec<String> = Vec::new();
+            for field in schema.fields() {
+                data_col_defs.push(format!("\"{}\" {}", field.name(), arrow_type_to_duckdb_sql(field.data_type())));
+            }
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
+                .map_err(DuckDBExError::DuckDB)?;
+            conn.execute_batch(&format!("CREATE TEMPORARY TABLE {data_table} ({})", data_col_defs.join(", ")))
+                .map_err(DuckDBExError::DuckDB)?;
+
+            let mut appender = conn.appender(&data_table)
+                .map_err(DuckDBExError::DuckDB)?;
+
+            for batch in &df.resource.batches {
+                appender.append_record_batch(batch.clone())
+                    .map_err(DuckDBExError::DuckDB)?;
+            }
+            appender.flush().map_err(DuckDBExError::DuckDB)?;
+            drop(appender);
+
+            // Create final table with __rowid from the data table
+            let col_list: Vec<String> = schema.fields().iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect();
+            conn.execute_batch(&format!(
+                "CREATE TEMPORARY TABLE {table_name} AS \
+                 SELECT ROW_NUMBER() OVER () - 1 AS __rowid, {} FROM {data_table}",
+                col_list.join(", ")
+            ))
+            .map_err(DuckDBExError::DuckDB)?;
+
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS {data_table}"))
+                .map_err(DuckDBExError::DuckDB)?;
         }
     }
 
