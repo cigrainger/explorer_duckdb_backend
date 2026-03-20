@@ -271,8 +271,22 @@ defmodule ExplorerDuckDB.DataFrame do
 
   @impl true
   def to_rows_stream(df, atom_keys?, chunk_size) do
-    rows = to_rows(df, atom_keys?)
-    Stream.chunk_every(rows, chunk_size)
+    # Stream rows lazily using chunks from the DataFrame
+    total = n_rows(df)
+
+    Stream.resource(
+      fn -> 0 end,
+      fn offset ->
+        if offset >= total do
+          {:halt, offset}
+        else
+          chunk_df = slice(df, offset, chunk_size)
+          rows = to_rows(chunk_df, atom_keys?)
+          {rows, offset + chunk_size}
+        end
+      end,
+      fn _ -> :ok end
+    )
   end
 
   # ============================================================
@@ -516,13 +530,14 @@ defmodule ExplorerDuckDB.DataFrame do
 
     # Try the NIF-based registration first (uses parameterized queries)
     case Native.df_register_table(db, df.data.resource, table_name) do
-      {} -> table_name
-      :ok -> table_name
-      {:ok, _} -> table_name
+      {} -> track_temp_table(table_name); table_name
+      :ok -> track_temp_table(table_name); table_name
+      {:ok, _} -> track_temp_table(table_name); table_name
       {:error, _error} ->
         # Fallback to SQL-based registration
         execute!(db, create_table_sql(df, table_name))
         insert_df_data(db, df, table_name)
+        track_temp_table(table_name)
         table_name
     end
   end
@@ -608,6 +623,7 @@ defmodule ExplorerDuckDB.DataFrame do
   def cleanup_tables(db, tables) do
     sql = Enum.map_join(tables, "; ", &"DROP TABLE IF EXISTS #{&1}")
     Native.db_execute(db, sql)
+    Enum.each(tables, &untrack_temp_table/1)
     :ok
   end
 
@@ -658,6 +674,18 @@ defmodule ExplorerDuckDB.DataFrame do
     pid_hash = :erlang.phash2(self())
     id = System.unique_integer([:positive])
     "__explorer_#{prefix}_#{pid_hash}_#{id}"
+  end
+
+  # Track temp tables per-process for cleanup
+  defp track_temp_table(name) do
+    tables = Process.get(:explorer_duckdb_temp_tables, MapSet.new())
+    Process.put(:explorer_duckdb_temp_tables, MapSet.put(tables, name))
+  end
+
+  @doc false
+  def untrack_temp_table(name) do
+    tables = Process.get(:explorer_duckdb_temp_tables, MapSet.new())
+    Process.put(:explorer_duckdb_temp_tables, MapSet.delete(tables, name))
   end
 
   @doc false

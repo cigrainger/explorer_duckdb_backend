@@ -175,4 +175,48 @@ defmodule ExplorerDuckDB do
   Opens an in-memory database if none exists.
   """
   def current_db, do: Shared.get_db()
+
+  @doc """
+  Clean up all temporary tables created by this process.
+  Call this when you're done with Explorer operations to free DuckDB resources.
+
+  This is called automatically when using `with_db/2`.
+  """
+  def cleanup do
+    tables = Process.get(:explorer_duckdb_temp_tables, MapSet.new())
+
+    if MapSet.size(tables) > 0 do
+      db = Shared.get_db()
+      sql = tables |> Enum.map_join("; ", &"DROP TABLE IF EXISTS #{&1}")
+      Native.db_execute(db, sql)
+      Process.put(:explorer_duckdb_temp_tables, MapSet.new())
+    end
+
+    :ok
+  end
+
+  @doc """
+  Execute a block with a DuckDB database, cleaning up temp tables afterward.
+
+  ## Examples
+
+      ExplorerDuckDB.with_db fn ->
+        df = DataFrame.from_csv!("data.csv")
+        df |> DataFrame.filter(x > 10) |> DataFrame.to_csv("filtered.csv")
+      end
+  """
+  def with_db(fun) do
+    with_db(:memory, fun)
+  end
+
+  def with_db(path, fun) do
+    open(path)
+    Explorer.Backend.put(ExplorerDuckDB)
+
+    try do
+      fun.()
+    after
+      cleanup()
+    end
+  end
 end
