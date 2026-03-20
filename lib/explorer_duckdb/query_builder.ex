@@ -172,7 +172,12 @@ defmodule ExplorerDuckDB.QueryBuilder do
     "SELECT * FROM (WITH #{q(table_name)} AS (SELECT * FROM #{prev}) #{sql})"
   end
 
-  # Helpers
-  defp q(name), do: "\"#{name}\""
+  # Helpers -- SQL identifier escaping
+  # Double-quotes inside identifiers are escaped by doubling them (SQL standard)
+  defp q(name) do
+    escaped = String.replace(to_string(name), "\"", "\"\"")
+    "\"#{escaped}\""
+  end
+
   defp cols_sql(columns), do: Enum.map_join(columns, ", ", &q/1)
 end

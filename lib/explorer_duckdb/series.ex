@@ -1495,17 +1495,5 @@ defmodule ExplorerDuckDB.Series do
 
   defp value_converter_for_dtype(_), do: &value_to_sql/1
 
-  defp value_to_sql(nil), do: "NULL"
-  defp value_to_sql(true), do: "TRUE"
-  defp value_to_sql(false), do: "FALSE"
-  defp value_to_sql(v) when is_integer(v), do: Integer.to_string(v)
-  defp value_to_sql(v) when is_float(v), do: Float.to_string(v)
-  defp value_to_sql(:nan), do: "'NaN'::DOUBLE"
-  defp value_to_sql(:infinity), do: "'Infinity'::DOUBLE"
-  defp value_to_sql(:neg_infinity), do: "'-Infinity'::DOUBLE"
-  defp value_to_sql(v) when is_binary(v), do: "'#{String.replace(v, "'", "''")}'"
-  defp value_to_sql(%Date{} = d), do: "'#{Date.to_iso8601(d)}'::DATE"
-  defp value_to_sql(%NaiveDateTime{} = dt), do: "'#{NaiveDateTime.to_iso8601(dt)}'::TIMESTAMP"
-  defp value_to_sql(%DateTime{} = dt), do: "'#{DateTime.to_iso8601(dt)}'::TIMESTAMPTZ"
-  defp value_to_sql(v), do: "'#{Kernel.inspect(v)}'"
+  defdelegate value_to_sql(v), to: ExplorerDuckDB.SQLHelpers
 end

@@ -6,7 +6,7 @@ defmodule ExplorerDuckDB.SQLBuilder do
   @doc """
   Convert a LazySeries operation tree into a DuckDB SQL expression string.
   """
-  def to_sql(%LazySeries{op: :column, args: [name]}), do: ~s("#{name}")
+  def to_sql(%LazySeries{op: :column, args: [name]}), do: quote_ident(name)
 
   # Arithmetic
   def to_sql(%LazySeries{op: :add, args: [left, right]}),
@@ -197,6 +197,11 @@ defmodule ExplorerDuckDB.SQLBuilder do
   defp escape_string(s) when is_binary(s) do
     escaped = String.replace(s, "'", "''")
     "'#{escaped}'"
+  end
+
+  defp quote_ident(name) do
+    escaped = name |> to_string() |> String.replace("\"", "\"\"")
+    "\"#{escaped}\""
   end
 
   defp dtype_to_duckdb_sql({:s, 8}), do: "TINYINT"

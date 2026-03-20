@@ -576,7 +576,7 @@ defmodule ExplorerDuckDB.DataFrame do
 
     sql =
       "WITH numbered AS (SELECT *, ROW_NUMBER() OVER () - 1 AS __rn FROM #{table}) " <>
-        "SELECT #{Enum.map_join(df.names, ", ", &~s("#{&1}"))} FROM numbered " <>
+        "SELECT #{Enum.map_join(df.names, ", ", &ExplorerDuckDB.SQLHelpers.quote_ident/1)} FROM numbered " <>
         "WHERE __rn IN (#{Enum.join(indices, ", ")})"
 
     result = query_raw(db, sql)
@@ -747,7 +747,7 @@ defmodule ExplorerDuckDB.DataFrame do
     col_defs =
       Enum.map_join(df.names, ", ", fn name ->
         dtype = Map.get(df.dtypes, name)
-        ~s("#{name}" #{explorer_dtype_to_duckdb_sql(dtype)})
+        "#{ExplorerDuckDB.SQLHelpers.quote_ident(name)} #{explorer_dtype_to_duckdb_sql(dtype)}"
       end)
 
     "CREATE TEMPORARY TABLE IF NOT EXISTS #{table_name} (#{col_defs})"
@@ -769,7 +769,7 @@ defmodule ExplorerDuckDB.DataFrame do
           "(#{vals})"
         end)
 
-      col_names = Enum.map_join(columns, ", ", &~s("#{&1}"))
+      col_names = Enum.map_join(columns, ", ", &ExplorerDuckDB.SQLHelpers.quote_ident/1)
       execute!(db, "INSERT INTO #{table_name} (#{col_names}) VALUES #{values_sql}")
     end
   end
@@ -799,24 +799,7 @@ defmodule ExplorerDuckDB.DataFrame do
     :ok
   end
 
-  defp value_to_sql(nil), do: "NULL"
-  defp value_to_sql(true), do: "TRUE"
-  defp value_to_sql(false), do: "FALSE"
-  defp value_to_sql(v) when is_integer(v), do: Integer.to_string(v)
-  defp value_to_sql(v) when is_float(v), do: Float.to_string(v)
-  defp value_to_sql(:nan), do: "'NaN'::DOUBLE"
-  defp value_to_sql(:infinity), do: "'Infinity'::DOUBLE"
-  defp value_to_sql(:neg_infinity), do: "'-Infinity'::DOUBLE"
-
-  defp value_to_sql(v) when is_binary(v) do
-    escaped = String.replace(v, "'", "''")
-    "'#{escaped}'"
-  end
-
-  defp value_to_sql(%Date{} = d), do: "'#{Date.to_iso8601(d)}'::DATE"
-  defp value_to_sql(%NaiveDateTime{} = dt), do: "'#{NaiveDateTime.to_iso8601(dt)}'::TIMESTAMP"
-  defp value_to_sql(%DateTime{} = dt), do: "'#{DateTime.to_iso8601(dt)}'::TIMESTAMPTZ"
-  defp value_to_sql(v), do: "'#{Elixir.Kernel.inspect(v)}'"
+  defdelegate value_to_sql(v), to: ExplorerDuckDB.SQLHelpers
 
   def explorer_dtype_to_duckdb_sql({:s, 8}), do: "TINYINT"
   def explorer_dtype_to_duckdb_sql({:s, 16}), do: "SMALLINT"
