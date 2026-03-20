@@ -724,6 +724,34 @@ fn df_query_stream_next<'a>(env: Env<'a>, stream: ExQueryStream) -> Term<'a> {
     }
 }
 
+// ============================================================
+// Perseus-style optimization: check if DataFrame can be mutated in place
+// ============================================================
+
+/// Check if this DataFrame has a cached temp table.
+/// Returns the table name if cached, nil otherwise.
+/// Used by Elixir to determine if re-registration can be skipped.
+#[rustler::nif]
+fn df_cached_table_name(df: ExDuckDBDataFrame) -> Option<String> {
+    df.resource
+        .cached_table
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(name, _, _)| name.clone()))
+}
+
+// Note: Perseus-style in-place mutation (Arc::strong_count == 1) is not
+// possible with Rustler's ResourceArc, which uses BEAM-level reference
+// counting that isn't exposed to NIFs. The BEAM GC manages the refcount
+// and only Drop is called when it reaches zero.
+//
+// To enable in-place mutation, Rustler would need to add:
+//   pub fn strong_count(resource: &ResourceArc<T>) -> usize
+// backed by enif_term_to_resource + reference counting inspection.
+//
+// For now, we use copy-on-write semantics: every compute_to_eager
+// creates a new DataFrame from the query result.
+
 pub fn arrow_type_to_duckdb_sql(dt: &duckdb::arrow::datatypes::DataType) -> String {
     match dt {
         duckdb::arrow::datatypes::DataType::Boolean => "BOOLEAN".to_string(),

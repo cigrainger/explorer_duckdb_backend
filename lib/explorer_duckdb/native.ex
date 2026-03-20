@@ -47,6 +47,7 @@ defmodule ExplorerDuckDB.Native do
   def df_load_ipc_stream(_binary), do: err()
   def df_query_stream_init(_db, _sql), do: err()
   def df_query_stream_next(_stream), do: err()
+  def df_cached_table_name(_df), do: err()
 
   # Series
   def s_dtype(_series), do: err()
