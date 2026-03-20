@@ -9,6 +9,13 @@ use crate::types::arrow_dtype_to_explorer;
 
 use std::sync::Mutex;
 
+mod atoms {
+    rustler::atoms! {
+        ok,
+        done,
+    }
+}
+
 /// Cached temp table: (table_name, connection_id, connection_ref_for_drop)
 type CachedTable = (String, u64, ResourceArc<ExDuckDBRef>);
 
@@ -249,7 +256,7 @@ fn df_ensure_table(db: ExDuckDB, df: ExDuckDBDataFrame) -> Result<String, NifErr
     // Generate table name scoped to connection
     let table_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     let table_name = format!("__explorer_c{conn_id}_{table_id}");
 
@@ -318,15 +325,18 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
         // Arrow zero-copy path
         let _ = conn.register_table_function::<ArrowVTab>("arrow");
 
-        let all_arrays: Vec<_> = (0..schema.fields().len())
+        let all_arrays: Result<Vec<_>, _> = (0..schema.fields().len())
             .map(|col_idx| {
                 let arrays: Vec<&dyn duckdb::arrow::array::Array> = df
                     .resource.batches.iter()
                     .map(|b| b.column(col_idx).as_ref())
                     .collect();
-                duckdb::arrow::compute::concat(&arrays).unwrap()
+                duckdb::arrow::compute::concat(&arrays)
             })
             .collect();
+
+        let all_arrays = all_arrays
+            .map_err(|e| DuckDBExError::Other(format!("concat arrays: {e}")))?;
 
         let combined = RecordBatch::try_new(schema.clone(), all_arrays)
             .map_err(|e| DuckDBExError::Other(format!("concat: {e}")))?;
@@ -705,22 +715,25 @@ fn df_query_stream_init(db: ExDuckDB, sql: String) -> Result<(ExQueryStream, u64
 
 /// Get the next batch from a streaming query. Returns {:ok, df} or :done.
 #[rustler::nif]
-fn df_query_stream_next<'a>(env: Env<'a>, stream: ExQueryStream) -> Term<'a> {
+fn df_query_stream_next<'a>(env: Env<'a>, stream: ExQueryStream) -> Result<Term<'a>, NifError> {
     let pos = {
-        let mut pos = stream.resource.position.lock().unwrap();
+        let mut pos = stream.resource.position.lock()
+            .map_err(|e| DuckDBExError::Other(format!("stream lock: {e}")))?;
         let current = *pos;
         *pos += 1;
         current
     };
 
-    let batches = stream.resource.batches.lock().unwrap();
+    let batches = stream.resource.batches.lock()
+        .map_err(|e| DuckDBExError::Other(format!("stream lock: {e}")))?;
+
     if pos >= batches.len() {
-        rustler::types::atom::Atom::from_str(env, "done").unwrap().encode(env)
+        Ok(atoms::done().encode(env))
     } else {
         let batch = batches[pos].clone();
         let schema = stream.resource.schema.clone();
         let df = ExDuckDBDataFrame::new(vec![batch], schema);
-        (rustler::types::atom::Atom::from_str(env, "ok").unwrap(), df).encode(env)
+        Ok((atoms::ok(), df).encode(env))
     }
 }
 

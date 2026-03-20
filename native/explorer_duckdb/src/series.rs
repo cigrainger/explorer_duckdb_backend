@@ -79,7 +79,7 @@ fn s_size(series: ExDuckDBSeries) -> u64 {
 
 /// Convert a Series to a single-column DataFrame for table registration.
 #[rustler::nif]
-fn s_to_dataframe(series: ExDuckDBSeries) -> crate::dataframe::ExDuckDBDataFrame {
+fn s_to_dataframe(series: ExDuckDBSeries) -> Result<crate::dataframe::ExDuckDBDataFrame, NifError> {
     let schema = Arc::new(duckdb::arrow::datatypes::Schema::new(vec![
         duckdb::arrow::datatypes::Field::new("value", series.resource.dtype.clone(), true),
     ]));
@@ -87,9 +87,9 @@ fn s_to_dataframe(series: ExDuckDBSeries) -> crate::dataframe::ExDuckDBDataFrame
         schema.clone(),
         vec![series.resource.array.clone()],
     )
-    .expect("failed to create record batch from series");
+    .map_err(|e| DuckDBExError::Other(format!("record batch from series: {e}")))?;
 
-    crate::dataframe::ExDuckDBDataFrame::new(vec![batch], schema)
+    Ok(crate::dataframe::ExDuckDBDataFrame::new(vec![batch], schema))
 }
 
 // ---- from_list constructors ----
@@ -426,7 +426,10 @@ pub fn array_value_to_term<'a>(env: Env<'a>, array: &dyn Array, idx: usize) -> T
                 let arr = array.as_any().downcast_ref::<duckdb::arrow::array::BinaryArray>();
                 if let Some(arr) = arr {
                     let bytes = arr.value(idx);
-                    let binary = rustler::OwnedBinary::new(bytes.len()).unwrap();
+                    let binary = match rustler::OwnedBinary::new(bytes.len()) {
+                        Some(b) => b,
+                        None => return atoms::nil_atom().encode(env),
+                    };
                     let mut binary = binary;
                     binary.as_mut_slice().copy_from_slice(bytes);
                     rustler::Binary::from_owned(binary, env).encode(env)
@@ -725,7 +728,7 @@ fn create_temp_series_table(
     use std::time::{SystemTime, UNIX_EPOCH};
     let id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     let table_name = format!("__explorer_s_{id}");
 
