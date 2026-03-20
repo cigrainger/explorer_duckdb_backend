@@ -207,12 +207,26 @@ fn df_to_rows<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<Term<'a>, NifEr
     Ok(rows.encode(env))
 }
 
+/// Register a DataFrame as a refcounted temporary table.
+/// Returns {table_name, resource_ref} -- the table is automatically dropped
+/// when the resource_ref is garbage collected.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_register_table_rc(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<crate::temp_table::ExTempTable, NifError> {
+    // Delegate to the existing registration logic
+    df_register_table_impl(&db, &df, &table_name)?;
+    Ok(crate::temp_table::ExTempTable::new(table_name, db.resource.clone()))
+}
+
 /// Register a DataFrame as a named temporary table in DuckDB.
 /// Adds a __rowid column to guarantee insertion order.
 /// Uses Arrow vtab zero-copy for batches <= 2048 rows, falls back to
 /// parameterized inserts for larger datasets (ArrowVTab limitation).
 #[rustler::nif(schedule = "DirtyCpu")]
 fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<(), NifError> {
+    df_register_table_impl(&db, &df, &table_name)
+}
+
+fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &str) -> Result<(), NifError> {
     use duckdb::vtab::arrow::ArrowVTab;
     use duckdb::vtab::arrow_recordbatch_to_query_params;
 

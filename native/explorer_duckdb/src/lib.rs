@@ -5,6 +5,7 @@ mod database;
 mod dataframe;
 mod error;
 mod series;
+mod temp_table;
 mod types;
 
 pub use database::{ExDuckDB, ExDuckDBRef};

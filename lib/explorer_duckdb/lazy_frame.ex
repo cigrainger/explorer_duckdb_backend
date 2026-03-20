@@ -24,8 +24,9 @@ defmodule ExplorerDuckDB.LazyFrame do
   """
   def from_eager(df) do
     db = Shared.get_db()
-    table_name = ExplorerDuckDB.DataFrame.register_df(db, df)
     groups = (df.groups[:columns] || [])
+
+    table_name = ExplorerDuckDB.DataFrame.register_df(db, df)
 
     lazy_data = %__MODULE__{
       db: db,
