@@ -741,6 +741,41 @@ fn df_query_stream_next<'a>(env: Env<'a>, stream: ExQueryStream) -> Result<Term<
 // Perseus-style optimization: check if DataFrame can be mutated in place
 // ============================================================
 
+/// Create a DataFrame from multiple Series (columns).
+/// Much faster than creating N temp tables and joining by ROW_NUMBER.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_from_series(names: Vec<String>, series_list: Vec<crate::series::ExDuckDBSeries>) -> Result<ExDuckDBDataFrame, NifError> {
+    if names.len() != series_list.len() {
+        return Err(DuckDBExError::Other("names and series count mismatch".to_string()).into());
+    }
+
+    if names.is_empty() {
+        let schema = std::sync::Arc::new(duckdb::arrow::datatypes::Schema::empty());
+        return Ok(ExDuckDBDataFrame::new(vec![], schema));
+    }
+
+    // Build schema and arrays from the series
+    let fields: Vec<duckdb::arrow::datatypes::Field> = names
+        .iter()
+        .zip(series_list.iter())
+        .map(|(name, series)| {
+            duckdb::arrow::datatypes::Field::new(name, series.resource.dtype.clone(), true)
+        })
+        .collect();
+
+    let schema = std::sync::Arc::new(duckdb::arrow::datatypes::Schema::new(fields));
+
+    let arrays: Vec<duckdb::arrow::array::ArrayRef> = series_list
+        .iter()
+        .map(|s| s.resource.array.clone())
+        .collect();
+
+    let batch = RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|e| DuckDBExError::Other(format!("from_series batch: {e}")))?;
+
+    Ok(ExDuckDBDataFrame::new(vec![batch], schema))
+}
+
 /// Check if this DataFrame has a cached temp table.
 /// Returns the table name if cached, nil otherwise.
 /// Used by Elixir to determine if re-registration can be skipped.

@@ -406,16 +406,21 @@ defmodule ExplorerDuckDB.DataFrame do
 
   @impl true
   def from_series(series_list) do
-    db = Shared.get_db()
+    names = Enum.map(series_list, fn {name, _} -> to_string(name) end)
+    series_refs = Enum.map(series_list, fn {_, series} -> series.data.resource end)
 
-    col_defs =
-      Enum.map(series_list, fn {name, series} ->
-        {name, series}
-      end)
+    case Native.df_from_series(names, series_refs) do
+      {:ok, ref} -> Shared.create_dataframe!(ref)
+      ref when is_reference(ref) -> Shared.create_dataframe!(ref)
+      {:error, _error} ->
+        # Fallback to the old join-based approach
+        db = Shared.get_db()
+        col_defs = Enum.map(series_list, fn {name, series} -> {name, series} end)
 
-    case build_dataframe_from_series(db, col_defs) do
-      {:ok, df_ref} -> Shared.create_dataframe!(df_ref)
-      {:error, error} -> raise RuntimeError, to_string(error)
+        case build_dataframe_from_series(db, col_defs) do
+          {:ok, df_ref} -> Shared.create_dataframe!(df_ref)
+          {:error, err} -> raise RuntimeError, to_string(err)
+        end
     end
   end
 
