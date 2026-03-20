@@ -78,6 +78,8 @@ defmodule ExplorerDuckDB.Native do
   def s_slice(_series, _offset, _length), do: err()
   def s_at(_series, _idx), do: err()
   def s_to_dataframe(_series), do: err()
+  def s_categorise(_indices, _categories), do: err()
+  def s_ewm_mean(_series, _alpha, _adjust), do: err()
   def df_from_arrow_stream_pointer(_ptr), do: err()
   def df_register_table_arrow(_db, _df, _table_name), do: err()
 end

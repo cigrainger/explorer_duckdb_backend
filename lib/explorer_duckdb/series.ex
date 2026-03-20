@@ -115,20 +115,21 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def categorise(series, categories_series) do
-    # Map integer indices to category string values
-    cat_list = Series.to_list(categories_series)
-    values = to_list(series)
+    series = ensure_materialized(series)
+    categories_series = ensure_materialized(categories_series)
 
-    result =
-      Enum.map(values, fn
-        nil -> nil
-        idx when is_integer(idx) and idx >= 0 and idx < length(cat_list) -> Enum.at(cat_list, idx)
-        _ -> nil
-      end)
+    case Native.s_categorise(series.data.resource, categories_series.data.resource) do
+      {:ok, ref} ->
+        s = Shared.create_series(ref)
+        %{s | dtype: :category}
 
-    # Return as category dtype
-    s = from_list(result, :string)
-    %{s | dtype: :category}
+      ref when is_reference(ref) ->
+        s = Shared.create_series(ref)
+        %{s | dtype: :category}
+
+      {:error, error} ->
+        raise RuntimeError, to_string(error)
+    end
   end
 
   @impl true
@@ -979,9 +980,13 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def ewm_mean(series, alpha, adjust, _min_periods, _ignore_nils) do
-    list = to_list(series)
-    result = compute_ewm_mean(list, alpha, adjust)
-    from_list(result, {:f, 64})
+    series = ensure_materialized(series)
+
+    case Native.s_ewm_mean(series.data.resource, alpha, adjust) do
+      {:ok, ref} -> Shared.create_series(ref)
+      ref when is_reference(ref) -> Shared.create_series(ref)
+      {:error, error} -> raise RuntimeError, to_string(error)
+    end
   end
 
   @impl true
@@ -992,23 +997,35 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def ewm_variance(series, alpha, adjust, _bias, _min_periods, _ignore_nils) do
-    list = to_list(series)
-    means = compute_ewm_mean(list, alpha, adjust)
+    series = ensure_materialized(series)
 
-    result =
-      list
-      |> Enum.with_index()
-      |> Enum.map(fn {val, i} ->
-        if Kernel.is_nil(val) do
-          nil
-        else
-          mean = Enum.at(means, i)
-          if Kernel.is_nil(mean), do: nil, else: (val - mean) * (val - mean)
-        end
-      end)
+    # Compute EWM mean via NIF
+    ewm_series =
+      case Native.s_ewm_mean(series.data.resource, alpha, adjust) do
+        {:ok, ref} -> Shared.create_series(ref)
+        ref when is_reference(ref) -> Shared.create_series(ref)
+      end
 
-    ewm_of_result = compute_ewm_mean(result, alpha, adjust)
-    from_list(ewm_of_result, {:f, 64})
+    # Compute (value - ewm_mean)^2 then ewm_mean of that
+    db = Shared.get_db()
+    t_val = create_temp_table(db, series)
+    t_ewm = create_temp_table(db, ewm_series)
+
+    try do
+      # Compute squared deviations
+      sql = "SELECT POWER(a.\"value\" - b.\"value\", 2) AS \"value\" FROM #{t_val} a JOIN #{t_ewm} b ON a.__rowid = b.__rowid ORDER BY a.__rowid"
+      sq_dev = query_series(db, sql)
+
+      # Apply EWM to squared deviations
+      sq_dev = ensure_materialized(sq_dev)
+      case Native.s_ewm_mean(sq_dev.data.resource, alpha, adjust) do
+        {:ok, ref} -> Shared.create_series(ref)
+        ref when is_reference(ref) -> Shared.create_series(ref)
+      end
+    after
+      cleanup(db, t_val)
+      cleanup(db, t_ewm)
+    end
   end
 
   # ============================================================
@@ -1456,24 +1473,6 @@ defmodule ExplorerDuckDB.Series do
     result = query_series(db, sql)
     cleanup(db, table)
     result
-  end
-
-  defp compute_ewm_mean(list, alpha, adjust) do
-    list
-    |> Enum.reduce({[], 0.0, 0.0}, fn val, {acc, weighted_sum, total_weight} ->
-      case val do
-        nil ->
-          {[nil | acc], weighted_sum, total_weight}
-
-        v ->
-          new_weighted_sum = v + (1 - alpha) * weighted_sum
-          new_total_weight = 1 + (1 - alpha) * total_weight
-          mean = if adjust, do: new_weighted_sum / new_total_weight, else: new_weighted_sum
-          {[mean | acc], new_weighted_sum, new_total_weight}
-      end
-    end)
-    |> elem(0)
-    |> Enum.reverse()
   end
 
   defp binary_series_op(%Series{} = left, %Series{} = right, op) do

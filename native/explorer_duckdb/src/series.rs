@@ -92,6 +92,104 @@ fn s_to_dataframe(series: ExDuckDBSeries) -> Result<crate::dataframe::ExDuckDBDa
     Ok(crate::dataframe::ExDuckDBDataFrame::new(vec![batch], schema))
 }
 
+/// Exponentially weighted moving mean. Pure Rust, no serialization.
+#[rustler::nif]
+fn s_ewm_mean(series: ExDuckDBSeries, alpha: f64, adjust: bool) -> Result<ExDuckDBSeries, NifError> {
+    let array = &series.resource.array;
+    let len = array.len();
+    let mut builder = Float64Array::builder(len);
+
+    let mut weighted_sum = 0.0_f64;
+    let mut total_weight = 0.0_f64;
+
+    for i in 0..len {
+        if array.is_null(i) {
+            builder.append_null();
+        } else {
+            let val = match array.data_type() {
+                ArrowDataType::Float64 => array.as_any().downcast_ref::<Float64Array>().unwrap().value(i),
+                ArrowDataType::Float32 => array.as_any().downcast_ref::<Float32Array>().unwrap().value(i) as f64,
+                ArrowDataType::Int64 => array.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as f64,
+                ArrowDataType::Int32 => array.as_any().downcast_ref::<Int32Array>().unwrap().value(i) as f64,
+                _ => 0.0,
+            };
+
+            weighted_sum = val + (1.0 - alpha) * weighted_sum;
+            total_weight = 1.0 + (1.0 - alpha) * total_weight;
+
+            let mean = if adjust {
+                weighted_sum / total_weight
+            } else {
+                weighted_sum
+            };
+
+            builder.append_value(mean);
+        }
+    }
+
+    let result: ArrayRef = Arc::new(builder.finish());
+    Ok(ExDuckDBSeries::new(result, series.resource.name.clone(), ArrowDataType::Float64))
+}
+
+/// Map integer indices to string values (categorise). Pure Rust, no serialization.
+#[rustler::nif]
+fn s_categorise(indices: ExDuckDBSeries, categories: ExDuckDBSeries) -> Result<ExDuckDBSeries, NifError> {
+    use duckdb::arrow::array::{Int64Array, StringArray, StringBuilder};
+
+    let idx_array = &indices.resource.array;
+    let cat_array = &categories.resource.array;
+
+    // Get category values as strings
+    let cat_strings: Vec<Option<&str>> = match cat_array.data_type() {
+        ArrowDataType::Utf8 => {
+            let arr = cat_array.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..arr.len()).map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) }).collect()
+        }
+        _ => return Err(DuckDBExError::Other("categories must be string type".to_string()).into()),
+    };
+
+    let len = idx_array.len();
+    let mut builder = StringBuilder::with_capacity(len, len * 8);
+
+    for i in 0..len {
+        if idx_array.is_null(i) {
+            builder.append_null();
+        } else {
+            // Extract the integer index
+            let idx = match idx_array.data_type() {
+                ArrowDataType::Int64 => {
+                    idx_array.as_any().downcast_ref::<Int64Array>().unwrap().value(i) as usize
+                }
+                ArrowDataType::Int32 => {
+                    idx_array.as_any().downcast_ref::<duckdb::arrow::array::Int32Array>().unwrap().value(i) as usize
+                }
+                ArrowDataType::UInt32 => {
+                    idx_array.as_any().downcast_ref::<duckdb::arrow::array::UInt32Array>().unwrap().value(i) as usize
+                }
+                ArrowDataType::UInt64 => {
+                    idx_array.as_any().downcast_ref::<duckdb::arrow::array::UInt64Array>().unwrap().value(i) as usize
+                }
+                _ => {
+                    builder.append_null();
+                    continue;
+                }
+            };
+
+            if idx < cat_strings.len() {
+                match cat_strings[idx] {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            } else {
+                builder.append_null();
+            }
+        }
+    }
+
+    let result: ArrayRef = Arc::new(builder.finish());
+    Ok(ExDuckDBSeries::new(result, indices.resource.name.clone(), ArrowDataType::Utf8))
+}
+
 // ---- from_list constructors ----
 
 #[rustler::nif]
