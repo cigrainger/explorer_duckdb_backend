@@ -1,0 +1,20 @@
+[package]
+name = "explorer_duckdb"
+version = "0.1.0"
+authors = []
+edition = "2021"
+
+[lib]
+name = "explorer_duckdb"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = { version = "0.36" }
+duckdb = { version = "1.2", features = ["bundled"] }
+thiserror = "2"
+chrono = "0.4"
+
+[features]
+default = ["nif_version_2_15"]
+nif_version_2_15 = ["rustler/nif_version_2_15"]
