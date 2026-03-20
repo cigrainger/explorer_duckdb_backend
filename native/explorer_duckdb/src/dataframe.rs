@@ -293,6 +293,26 @@ fn df_table_names(db: ExDuckDB, table_name: String) -> Result<Vec<String>, NifEr
     Ok(cols.into_iter().filter(|c| c != "__rowid").collect())
 }
 
+/// Create a DataFrame from an Arrow C Stream pointer (used by ADBC).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_from_arrow_stream_pointer(stream_ptr: u64) -> Result<ExDuckDBDataFrame, NifError> {
+    use duckdb::arrow::array::RecordBatchReader;
+    use duckdb::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+
+    let ptr = stream_ptr as *mut FFI_ArrowArrayStream;
+    let stream = unsafe { std::ptr::read(ptr) };
+
+    let reader = ArrowArrayStreamReader::try_new(stream)
+        .map_err(|e| DuckDBExError::Other(format!("arrow stream error: {e}")))?;
+
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(ExDuckDBDataFrame::new(batches, schema))
+}
+
 // Internal helpers
 
 fn df_query_inner(db: &ExDuckDB, sql: &str) -> Result<ExDuckDBDataFrame, NifError> {

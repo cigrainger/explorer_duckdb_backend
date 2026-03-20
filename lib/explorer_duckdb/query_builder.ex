@@ -2,27 +2,52 @@ defmodule ExplorerDuckDB.QueryBuilder do
   @moduledoc """
   Translates a list of accumulated lazy operations into a single DuckDB SQL query.
 
+  Uses CTEs (Common Table Expressions) for readability and debuggability:
+
+      WITH __s0 AS (SELECT * FROM source),
+           __s1 AS (SELECT * FROM __s0 WHERE "x" > 10),
+           __s2 AS (SELECT * FROM __s1 ORDER BY "x" ASC NULLS FIRST)
+      SELECT * FROM __s2
+
   Operations are stored newest-first and reversed before processing.
-  Each operation wraps the previous query as a subquery.
   """
 
   @doc """
   Builds a SQL query string from a source and operations list.
   Returns a SQL string ready for execution.
   """
+  def build(source, []) do
+    source
+  end
+
   def build(source, operations) do
-    operations
-    |> Enum.reverse()
-    |> Enum.reduce(source, &apply_op/2)
+    steps =
+      operations
+      |> Enum.reverse()
+      |> Enum.with_index()
+      |> Enum.map_reduce(source, fn {op, idx}, prev ->
+        step_name = "__s#{idx}"
+        sql = apply_op(op, prev)
+        {{step_name, sql}, step_name}
+      end)
+
+    {cte_pairs, final_step} = steps
+
+    ctes =
+      Enum.map_join(cte_pairs, ",\n     ", fn {name, sql} ->
+        "#{name} AS (#{sql})"
+      end)
+
+    "WITH #{ctes}\nSELECT * FROM #{final_step}"
   end
 
   defp apply_op({:filter, expr}, prev) do
-    "(SELECT * FROM #{prev} WHERE #{expr})"
+    "SELECT * FROM #{prev} WHERE #{expr}"
   end
 
   defp apply_op({:select, columns}, prev) do
     cols = cols_sql(columns)
-    "(SELECT #{cols} FROM #{prev})"
+    "SELECT #{cols} FROM #{prev}"
   end
 
   defp apply_op({:mutate, out_columns, mutations}, prev) do
@@ -36,7 +61,7 @@ defmodule ExplorerDuckDB.QueryBuilder do
         end
       end)
 
-    "(SELECT #{Enum.join(select_parts, ", ")} FROM #{prev})"
+    "SELECT #{Enum.join(select_parts, ", ")} FROM #{prev}"
   end
 
   defp apply_op({:sort, sort_exprs}, prev) do
@@ -47,20 +72,20 @@ defmodule ExplorerDuckDB.QueryBuilder do
         "#{expr} #{dir_str} #{nulls_str}"
       end)
 
-    "(SELECT * FROM #{prev} ORDER BY #{order})"
+    "SELECT * FROM #{prev} ORDER BY #{order}"
   end
 
   defp apply_op({:distinct, columns}, prev) do
     cols = cols_sql(columns)
-    "(SELECT DISTINCT ON (#{cols}) * FROM #{prev})"
+    "SELECT DISTINCT ON (#{cols}) * FROM #{prev}"
   end
 
   defp apply_op({:limit, n}, prev) do
-    "(SELECT * FROM #{prev} LIMIT #{n})"
+    "SELECT * FROM #{prev} LIMIT #{n}"
   end
 
   defp apply_op({:limit, n, offset}, prev) do
-    "(SELECT * FROM #{prev} LIMIT #{n} OFFSET #{offset})"
+    "SELECT * FROM #{prev} LIMIT #{n} OFFSET #{offset}"
   end
 
   defp apply_op({:rename, all_columns, renames}, prev) do
@@ -74,12 +99,12 @@ defmodule ExplorerDuckDB.QueryBuilder do
         end
       end)
 
-    "(SELECT #{Enum.join(select_parts, ", ")} FROM #{prev})"
+    "SELECT #{Enum.join(select_parts, ", ")} FROM #{prev}"
   end
 
   defp apply_op({:drop_nil, columns}, prev) do
     where = Enum.map_join(columns, " AND ", fn col -> "#{q(col)} IS NOT NULL" end)
-    "(SELECT * FROM #{prev} WHERE #{where})"
+    "SELECT * FROM #{prev} WHERE #{where}"
   end
 
   defp apply_op({:summarise, group_cols, agg_exprs}, prev) do
@@ -88,10 +113,10 @@ defmodule ExplorerDuckDB.QueryBuilder do
     select = Enum.join(group_parts ++ agg_parts, ", ")
 
     if group_cols == [] do
-      "(SELECT #{select} FROM #{prev})"
+      "SELECT #{select} FROM #{prev}"
     else
       group_by = cols_sql(group_cols)
-      "(SELECT #{select} FROM #{prev} GROUP BY #{group_by})"
+      "SELECT #{select} FROM #{prev} GROUP BY #{group_by}"
     end
   end
 
@@ -119,14 +144,14 @@ defmodule ExplorerDuckDB.QueryBuilder do
       {side, col} -> "#{side}.#{q(col)}"
     end)
 
-    "(SELECT #{select} FROM #{prev} l #{join_str} #{right_source} r #{on_clause})"
+    "SELECT #{select} FROM #{prev} l #{join_str} #{right_source} r #{on_clause}"
   end
 
   defp apply_op({:union_all, other_sources, columns}, prev) do
     cols = cols_sql(columns)
     first = "SELECT #{cols} FROM #{prev}"
     rest = Enum.map(other_sources, fn src -> "SELECT #{cols} FROM #{src}" end)
-    "(#{Enum.join([first | rest], " UNION ALL ")})"
+    Enum.join([first | rest], " UNION ALL ")
   end
 
   defp apply_op({:nil_count, columns}, prev) do
@@ -135,12 +160,12 @@ defmodule ExplorerDuckDB.QueryBuilder do
         "COUNT(*) FILTER (WHERE #{q(name)} IS NULL) AS #{q(name)}"
       end)
 
-    "(SELECT #{Enum.join(parts, ", ")} FROM #{prev})"
+    "SELECT #{Enum.join(parts, ", ")} FROM #{prev}"
   end
 
   defp apply_op({:raw_sql, sql, table_name}, prev) do
-    # Replace table_name reference with the prev query
-    "(WITH #{q(table_name)} AS (SELECT * FROM #{prev}) #{sql})"
+    # Wrap prev as a CTE with the user's chosen table name, then run their SQL
+    "SELECT * FROM (WITH #{q(table_name)} AS (SELECT * FROM #{prev}) #{sql})"
   end
 
   # Helpers

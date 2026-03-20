@@ -206,8 +206,25 @@ defmodule ExplorerDuckDB.DataFrame do
   @impl true
   def load_ipc_stream(_c, _cols), do: {:error, RuntimeError.exception("IPC Stream not supported by DuckDB backend")}
 
+  @compile {:no_warn_undefined, Adbc.Connection}
+
   @impl true
-  def from_query(_c, _q, _p), do: {:error, RuntimeError.exception("ADBC not yet supported by DuckDB backend")}
+  def from_query(conn, query, params) do
+    adbc_result =
+      Adbc.Connection.query_pointer(conn, query, params, fn pointer, _num_rows ->
+        Native.df_from_arrow_stream_pointer(pointer)
+      end)
+
+    with {:ok, df_result} <- adbc_result,
+         {:ok, df} <- df_result do
+      Shared.create_dataframe(df)
+    else
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  rescue
+    UndefinedFunctionError ->
+      {:error, RuntimeError.exception("ADBC not available. Add {:adbc, \"~> 0.1\"} to your deps.")}
+  end
 
   # ============================================================
   # Conversion

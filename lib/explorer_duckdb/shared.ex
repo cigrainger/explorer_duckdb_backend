@@ -73,7 +73,16 @@ defmodule ExplorerDuckDB.Shared do
   def get_db do
     case Process.get(:explorer_duckdb_db) do
       nil ->
-        case Native.db_open() do
+        # Check application config for a default database path
+        path = Application.get_env(:explorer_duckdb_backend, :database, :memory)
+
+        result =
+          case path do
+            :memory -> Native.db_open()
+            path when is_binary(path) -> Native.db_open_path(path)
+          end
+
+        case result do
           {:ok, db} ->
             Process.put(:explorer_duckdb_db, db)
             db

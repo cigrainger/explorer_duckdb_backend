@@ -47,13 +47,26 @@ defmodule ExplorerDuckDB.LazyFrame do
     db = lazy.db
 
     # Exclude __rowid from the result
+    # If the query is a CTE (WITH ...), wrap it to exclude __rowid
+    exclude_sql =
+      if String.starts_with?(sql, "WITH ") do
+        # Replace the final SELECT * with SELECT * EXCLUDE (__rowid)
+        String.replace(sql, ~r/SELECT \* FROM (__s\d+)$/, "SELECT * EXCLUDE (__rowid) FROM \\1")
+      else
+        # Simple source -- wrap in subquery
+        "SELECT * EXCLUDE (__rowid) FROM (SELECT * FROM #{sql})"
+      end
+
     result =
-      case Native.df_query(db, "SELECT * EXCLUDE (__rowid) FROM #{sql}") do
+      case Native.df_query(db, exclude_sql) do
         {:ok, ref} -> ref
         ref when is_reference(ref) -> ref
         {:error, _} ->
-          # Fallback: no __rowid column (e.g., raw SQL source)
-          case Native.df_query(db, "SELECT * FROM #{sql}") do
+          # Fallback: no __rowid column
+          fallback_sql =
+            if String.starts_with?(sql, "WITH "), do: sql, else: "SELECT * FROM #{sql}"
+
+          case Native.df_query(db, fallback_sql) do
             {:ok, ref} -> ref
             ref when is_reference(ref) -> ref
             {:error, error} -> raise RuntimeError, to_string(error)
@@ -182,6 +195,7 @@ defmodule ExplorerDuckDB.LazyFrame do
   def load_ndjson(c, isl, bs), do: ExplorerDuckDB.DataFrame.load_ndjson(c, isl, bs)
 
   @impl true
+  @compile {:no_warn_undefined, Adbc.Connection}
   def from_query(c, q, p), do: ExplorerDuckDB.DataFrame.from_query(c, q, p)
 
   # ============================================================
@@ -197,7 +211,13 @@ defmodule ExplorerDuckDB.LazyFrame do
     lazy = df.data
     sql = QueryBuilder.build(lazy.source, lazy.operations)
 
-    count_sql = "SELECT COUNT(*) AS c FROM #{sql}"
+    count_sql =
+      if String.starts_with?(sql, "WITH ") do
+        # CTE query -- wrap to count
+        String.replace(sql, ~r/SELECT \* FROM (__s\d+)$/, "SELECT COUNT(*) AS c FROM \\1")
+      else
+        "SELECT COUNT(*) AS c FROM #{sql}"
+      end
 
     total =
       case Native.df_query(lazy.db, count_sql) do
