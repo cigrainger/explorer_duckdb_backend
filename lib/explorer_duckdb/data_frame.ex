@@ -20,22 +20,50 @@ defmodule ExplorerDuckDB.DataFrame do
   def from_csv(
         entry,
         _dtypes,
-        _delimiter,
+        delimiter,
         _nil_values,
-        _skip_rows,
+        skip_rows,
         _skip_rows_after_header,
-        _header?,
+        header?,
         _encoding,
-        _max_rows,
-        _columns,
+        max_rows,
+        columns,
         _infer_schema_length,
         _parse_dates,
         _eol_delimiter
       ) do
     db = Shared.get_db()
     path = entry_to_path(entry)
+    escaped_path = String.replace(path, "'", "''")
 
-    case Native.df_from_csv(db, path) do
+    # Build DuckDB read_csv_auto options
+    opts = ["'#{escaped_path}'"]
+    opts = if delimiter != ",", do: opts ++ ["delim = '#{delimiter}'"], else: opts
+    opts = if header? == false, do: opts ++ ["header = false"], else: opts
+    opts = if skip_rows && skip_rows > 0, do: opts ++ ["skip = #{skip_rows}"], else: opts
+
+    sql = "SELECT * FROM read_csv_auto(#{Enum.join(opts, ", ")})"
+
+    # Apply column selection
+    sql =
+      if columns && columns != [] do
+        col_list =
+          columns
+          |> Enum.map(fn
+            c when is_binary(c) -> "\"#{c}\""
+            c when is_integer(c) -> "column#{c}"
+          end)
+          |> Enum.join(", ")
+
+        "SELECT #{col_list} FROM (#{sql})"
+      else
+        sql
+      end
+
+    # Apply max_rows
+    sql = if max_rows, do: "#{sql} LIMIT #{max_rows}", else: sql
+
+    case Native.df_query(db, sql) do
       {:ok, df_ref} -> Shared.create_dataframe(df_ref)
       {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
       df_ref -> Shared.create_dataframe(df_ref)
@@ -85,11 +113,33 @@ defmodule ExplorerDuckDB.DataFrame do
   # ============================================================
 
   @impl true
-  def from_parquet(entry, _max_rows, _columns, _rechunk) do
+  def from_parquet(entry, max_rows, columns, _rechunk) do
     db = Shared.get_db()
     path = entry_to_path(entry)
+    escaped_path = String.replace(path, "'", "''")
 
-    case Native.df_from_parquet(db, path) do
+    sql = "SELECT * FROM read_parquet('#{escaped_path}')"
+
+    # Apply column selection
+    sql =
+      if columns && columns != [] do
+        col_list =
+          columns
+          |> Enum.map(fn
+            c when is_binary(c) -> "\"#{c}\""
+            c when is_integer(c) -> "column#{c}"
+          end)
+          |> Enum.join(", ")
+
+        "SELECT #{col_list} FROM (#{sql})"
+      else
+        sql
+      end
+
+    # Apply max_rows
+    sql = if max_rows, do: "#{sql} LIMIT #{max_rows}", else: sql
+
+    case Native.df_query(db, sql) do
       {:ok, df_ref} -> Shared.create_dataframe(df_ref)
       {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
       df_ref -> Shared.create_dataframe(df_ref)
