@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rustler = { version = "0.36" }
-duckdb = { version = "1.2", features = ["bundled"] }
+duckdb = { version = "1.2", features = ["bundled", "vtab-arrow"] }
 thiserror = "2"
 chrono = "0.4"
 

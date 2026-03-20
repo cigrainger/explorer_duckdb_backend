@@ -18,3 +18,5 @@ erl_crash.dump
 # Temp files
 /tmp/
 .claude/
+*.duckdb
+*.duckdb.wal

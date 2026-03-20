@@ -207,8 +207,9 @@ fn df_to_rows<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<Term<'a>, NifEr
     Ok(rows.encode(env))
 }
 
-/// Register a DataFrame as a named temporary table in DuckDB. Callable from Elixir.
+/// Register a DataFrame as a named temporary table in DuckDB.
 /// Adds a __rowid column to guarantee insertion order.
+/// Uses batched parameterized inserts within transactions for performance.
 #[rustler::nif(schedule = "DirtyCpu")]
 fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<(), NifError> {
     let conn = db
@@ -219,7 +220,10 @@ fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) ->
 
     let schema = &df.resource.schema;
 
-    // Build column definitions with __rowid
+    // Drop if exists, create with __rowid
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
+        .map_err(DuckDBExError::DuckDB)?;
+
     let mut col_defs: Vec<String> = vec!["__rowid BIGINT".to_string()];
     for field in schema.fields() {
         col_defs.push(format!(
@@ -229,33 +233,25 @@ fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) ->
         ));
     }
 
-    // Drop if exists, then create
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
-        .map_err(DuckDBExError::DuckDB)?;
     conn.execute_batch(&format!(
         "CREATE TEMPORARY TABLE {table_name} ({})",
         col_defs.join(", ")
     ))
     .map_err(DuckDBExError::DuckDB)?;
 
-    // Insert data with row index using batched parameterized queries
-    // Batch size of 1000 rows reduces round-trip overhead dramatically
+    // Batched parameterized inserts within transactions
     if !df.resource.batches.is_empty() {
         let num_cols = schema.fields().len();
-        let batch_size = 1000usize;
-
-        // Single-row placeholder for prepared statement
-        let single_row_placeholders: Vec<String> =
+        let placeholders: Vec<String> =
             (1..=(num_cols + 1)).map(|i| format!("${i}")).collect();
-        let single_insert_sql = format!(
+        let insert_sql = format!(
             "INSERT INTO {table_name} VALUES ({})",
-            single_row_placeholders.join(", ")
+            placeholders.join(", ")
         );
 
         conn.execute_batch("BEGIN TRANSACTION").map_err(DuckDBExError::DuckDB)?;
-
         let mut row_id: i64 = 0;
-        let mut pending_count = 0usize;
+        let mut pending = 0usize;
 
         for batch in &df.resource.batches {
             for row_idx in 0..batch.num_rows() {
@@ -263,16 +259,14 @@ fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) ->
                 params.push(Box::new(row_id));
                 let row_params = row_to_params(batch, row_idx);
                 params.extend(row_params);
-                conn.execute(&single_insert_sql, duckdb::params_from_iter(params.iter()))
+                conn.execute(&insert_sql, duckdb::params_from_iter(params.iter()))
                     .map_err(DuckDBExError::DuckDB)?;
                 row_id += 1;
-                pending_count += 1;
-
-                // Commit and restart transaction every batch_size rows
-                if pending_count >= batch_size {
+                pending += 1;
+                if pending >= 1000 {
                     conn.execute_batch("COMMIT; BEGIN TRANSACTION")
                         .map_err(DuckDBExError::DuckDB)?;
-                    pending_count = 0;
+                    pending = 0;
                 }
             }
         }
