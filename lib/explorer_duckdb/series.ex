@@ -242,42 +242,61 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def at_every(series, every_n) do
-    list = to_list(series)
-    selected = list |> Enum.with_index() |> Enum.filter(fn {_, i} -> rem(i, every_n) == 0 end) |> Enum.map(&elem(&1, 0))
-    from_list(selected, series.dtype)
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
+
+    try do
+      sql = "SELECT \"value\" FROM (SELECT \"value\", (ROW_NUMBER() OVER (ORDER BY __rowid) - 1) AS __idx FROM #{table}) WHERE __idx % #{every_n} = 0"
+      query_series(db, sql)
+    after
+      cleanup(db, table)
+    end
   end
 
   @impl true
   def mask(series, %Series{} = mask_series) do
-    values = to_list(series)
-    mask_values = Series.to_list(mask_series)
+    series = ensure_materialized(series)
+    mask_series = ensure_materialized(mask_series)
+    db = Shared.get_db()
+    t1 = create_temp_table(db, series)
+    t2 = create_temp_table(db, mask_series)
 
-    selected =
-      Enum.zip(values, mask_values)
-      |> Enum.filter(fn {_, m} -> m == true end)
-      |> Enum.map(&elem(&1, 0))
-
-    from_list(selected, series.dtype)
+    try do
+      sql = "SELECT a.\"value\" FROM #{t1} a JOIN #{t2} b ON a.__rowid = b.__rowid WHERE b.\"value\" = true ORDER BY a.__rowid"
+      query_series(db, sql)
+    after
+      cleanup(db, t1)
+      cleanup(db, t2)
+    end
   end
 
   @impl true
   def slice(series, indices) when is_list(indices) do
-    list = to_list(series)
-    len = length(list)
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
 
-    selected =
-      Enum.map(indices, fn i ->
-        actual_i = if i < 0, do: len + i, else: i
-        Enum.at(list, actual_i)
-      end)
+    try do
+      # Handle negative indices by converting to positive
+      n = size(series)
+      positive_indices = Enum.map(indices, fn i -> if i < 0, do: n + i, else: i end)
+      idx_list = Enum.join(positive_indices, ", ")
 
-    from_list(selected, series.dtype)
+      sql = "SELECT \"value\" FROM (SELECT \"value\", ROW_NUMBER() OVER (ORDER BY __rowid) - 1 AS __idx FROM #{table}) WHERE __idx IN (#{idx_list}) ORDER BY __idx"
+      query_series(db, sql)
+    after
+      cleanup(db, table)
+    end
   end
 
-  def slice(series, %Range{} = range) do
-    list = to_list(series)
-    selected = Enum.slice(list, range)
-    from_list(selected, series.dtype)
+  def slice(series, %Range{first: first, last: last, step: step}) do
+    series = ensure_materialized(series)
+    n = size(series)
+    first = if first < 0, do: n + first, else: first
+    last = if last < 0, do: n + last, else: last
+    indices = Enum.to_list(first..last//step)
+    slice(series, indices)
   end
 
   @impl true
@@ -293,39 +312,52 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def format(series_list) do
-    # Concatenate multiple series as strings
-    lists = Enum.map(series_list, &Series.to_list/1)
-    len = length(hd(lists))
+    db = Shared.get_db()
+    materialized = Enum.map(series_list, &ensure_materialized/1)
+    tables = Enum.with_index(materialized, fn s, i -> {create_temp_table(db, s), "t#{i}"} end)
 
-    result =
-      for i <- 0..(len - 1) do
-        parts = Enum.map(lists, fn l -> Enum.at(l, i) end)
-        if Enum.any?(parts, &Kernel.is_nil/1), do: nil, else: Enum.join(parts, "")
-      end
+    try do
+      concat_expr = Enum.map_join(tables, " || ", fn {_, alias_name} -> "#{alias_name}.\"value\"::VARCHAR" end)
+      from_clause = tables |> Enum.with_index() |> Enum.map_join(" ", fn {{table, alias_name}, idx} ->
+        if idx == 0, do: "#{table} #{alias_name}", else: "JOIN #{table} #{alias_name} ON t0.__rowid = #{alias_name}.__rowid"
+      end)
 
-    from_list(result, :string)
+      sql = "SELECT #{concat_expr} AS \"value\" FROM #{from_clause} ORDER BY t0.__rowid"
+      query_series(db, sql)
+    after
+      Enum.each(tables, fn {table, _} -> cleanup(db, table) end)
+    end
   end
 
   @impl true
   def concat(series_list) do
-    dtype = hd(series_list) |> Series.dtype()
-    lists = Enum.flat_map(series_list, &Series.to_list/1)
-    from_list(lists, dtype)
+    db = Shared.get_db()
+    materialized = Enum.map(series_list, &ensure_materialized/1)
+    tables = Enum.map(materialized, fn s -> create_temp_table(db, s) end)
+
+    try do
+      union_sql = Enum.map_join(tables, " UNION ALL ", fn t -> "(SELECT \"value\" FROM #{t} ORDER BY __rowid)" end)
+      query_series(db, union_sql)
+    after
+      Enum.each(tables, fn t -> cleanup(db, t) end)
+    end
   end
 
   @impl true
   def coalesce(s1, s2) do
-    l1 = Series.to_list(s1)
-    l2 = Series.to_list(s2)
+    s1 = ensure_materialized(s1)
+    s2 = ensure_materialized(s2)
+    db = Shared.get_db()
+    t1 = create_temp_table(db, s1)
+    t2 = create_temp_table(db, s2)
 
-    result =
-      Enum.zip(l1, l2)
-      |> Enum.map(fn
-        {nil, v2} -> v2
-        {v1, _} -> v1
-      end)
-
-    from_list(result, s1.dtype)
+    try do
+      sql = "SELECT COALESCE(a.\"value\", b.\"value\") AS \"value\" FROM #{t1} a JOIN #{t2} b ON a.__rowid = b.__rowid ORDER BY a.__rowid"
+      query_series(db, sql)
+    after
+      cleanup(db, t1)
+      cleanup(db, t2)
+    end
   end
 
   @impl true
@@ -339,40 +371,42 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def select(pred, on_true, on_false) do
-    pred_list = Series.to_list(pred)
-    true_list = Series.to_list(on_true)
-    false_list = Series.to_list(on_false)
+    pred = ensure_materialized(pred)
+    on_true = ensure_materialized(on_true)
+    on_false = ensure_materialized(on_false)
+    db = Shared.get_db()
+    tp = create_temp_table(db, pred)
+    tt = create_temp_table(db, on_true)
+    tf = create_temp_table(db, on_false)
 
-    result =
-      Enum.zip([pred_list, true_list, false_list])
-      |> Enum.map(fn
-        {true, t, _} -> t
-        {false, _, f} -> f
-        {nil, _, _} -> nil
-      end)
-
-    from_list(result, on_true.dtype)
+    try do
+      sql = "SELECT CASE WHEN p.\"value\" THEN t.\"value\" ELSE f.\"value\" END AS \"value\" " <>
+        "FROM #{tp} p JOIN #{tt} t ON p.__rowid = t.__rowid JOIN #{tf} f ON p.__rowid = f.__rowid ORDER BY p.__rowid"
+      query_series(db, sql)
+    after
+      cleanup(db, tp)
+      cleanup(db, tt)
+      cleanup(db, tf)
+    end
   end
 
   @impl true
-  def shift(series, offset, default) do
-    list = to_list(series)
-    len = length(list)
-    fill = default
+  def shift(series, offset, _default) do
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
 
-    shifted =
-      cond do
-        offset > 0 ->
-          List.duplicate(fill, min(offset, len)) ++ Enum.take(list, len - offset)
-
-        offset < 0 ->
-          Enum.drop(list, -offset) ++ List.duplicate(fill, min(-offset, len))
-
-        true ->
-          list
+    try do
+      if offset >= 0 do
+        sql = "SELECT LAG(\"value\", #{offset}) OVER (ORDER BY __rowid) AS \"value\" FROM #{table} ORDER BY __rowid"
+        query_series(db, sql)
+      else
+        sql = "SELECT LEAD(\"value\", #{-offset}) OVER (ORDER BY __rowid) AS \"value\" FROM #{table} ORDER BY __rowid"
+        query_series(db, sql)
       end
-
-    from_list(shifted, series.dtype)
+    after
+      cleanup(db, table)
+    end
   end
 
   @impl true
@@ -515,20 +549,41 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def all?(series) do
-    list = to_list(series)
-    Enum.all?(list, & &1)
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
+
+    try do
+      scalar_query(db, "SELECT BOOL_AND(\"value\") FROM #{table}")
+    after
+      cleanup(db, table)
+    end
   end
 
   @impl true
   def any?(series) do
-    list = to_list(series)
-    Enum.any?(list, & &1)
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
+
+    try do
+      scalar_query(db, "SELECT BOOL_OR(\"value\") FROM #{table}")
+    after
+      cleanup(db, table)
+    end
   end
 
   @impl true
   def row_index(series) do
-    n = size(series)
-    from_list(Enum.to_list(0..(n - 1)//1), {:u, 32})
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
+
+    try do
+      query_series(db, "SELECT (ROW_NUMBER() OVER (ORDER BY __rowid) - 1)::UINTEGER AS \"value\" FROM #{table}")
+    after
+      cleanup(db, table)
+    end
   end
 
   # ============================================================
@@ -566,24 +621,25 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def peaks(series, kind) do
-    list = to_list(series)
-    len = length(list)
+    series = ensure_materialized(series)
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
 
-    result =
-      list
-      |> Enum.with_index()
-      |> Enum.map(fn {val, i} ->
-        prev = if i > 0, do: Enum.at(list, i - 1), else: nil
-        next = if i < len - 1, do: Enum.at(list, i + 1), else: nil
+    try do
+      comp = if kind == :max, do: ">=", else: "<="
 
-        cond do
-          Kernel.is_nil(val) -> false
-          kind == :max -> (Kernel.is_nil(prev) or val >= prev) and (Kernel.is_nil(next) or val >= next)
-          kind == :min -> (Kernel.is_nil(prev) or val <= prev) and (Kernel.is_nil(next) or val <= next)
-        end
-      end)
+      sql = """
+        SELECT CASE
+          WHEN \"value\" #{comp} COALESCE(LAG(\"value\") OVER (ORDER BY __rowid), \"value\")
+           AND \"value\" #{comp} COALESCE(LEAD(\"value\") OVER (ORDER BY __rowid), \"value\")
+          THEN true ELSE false END AS "value"
+        FROM #{table} ORDER BY __rowid
+      """
 
-    from_list(result, :boolean)
+      query_series(db, sql)
+    after
+      cleanup(db, table)
+    end
   end
 
   # ============================================================
@@ -1013,9 +1069,7 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def unary_not(series) do
-    list = to_list(series)
-    new_list = Enum.map(list, fn nil -> nil; v -> not v end)
-    from_list(new_list, :boolean)
+    sql_transform(series, "NOT \"value\"")
   end
 
   # ============================================================
