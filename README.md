@@ -6,15 +6,22 @@ Explorer is Elixir's primary DataFrame library. This package provides an alterna
 
 ## Architecture
 
-The backend is **lazy-first**: DataFrame operations accumulate as a SQL query plan. When results are needed, the entire plan executes as a single optimized DuckDB query. The eager API is syntactic sugar that calls `lazy() |> op() |> compute()`.
+The backend is **lazy-first**: DataFrame operations accumulate as a SQL query plan (CTEs). When results are needed, the entire plan executes as a single optimized DuckDB query. The eager API is syntactic sugar that calls `lazy() |> op() |> compute()`.
 
 ```
-Explorer API  ->  LazyFrame (accumulates ops)  ->  QueryBuilder (generates SQL)  ->  DuckDB (executes)
-                                                                                         |
-                                                                                    Arrow RecordBatch
-                                                                                         |
-                                                                              Rustler NIF  ->  Elixir
+Explorer API  →  LazyFrame (accumulates ops)  →  QueryBuilder (CTE SQL)  →  DuckDB (executes)
+                                                                                   ↓
+                                                                         Arrow RecordBatch (zero-copy)
+                                                                                   ↓
+                                                                         Rustler NIF  →  Elixir
 ```
+
+**Key optimizations:**
+- Arrow vtab zero-copy table registration (≤2048 rows instant, larger chunked at 14x vs row-by-row)
+- Connection-scoped refcounted temp table caching (0ms for repeated operations on the same DataFrame)
+- NIF resource Drop auto-cleans temp tables on garbage collection
+- Series SQL composition (chained transforms produce one query, not N temp tables)
+- CTE-based query building for readable, optimizable SQL
 
 ## Installation
 
@@ -26,7 +33,20 @@ def deps do
 end
 ```
 
-Requires Rust toolchain for compilation (the DuckDB C++ library is compiled from source via `duckdb-rs`).
+Requires Rust toolchain for compilation (DuckDB C++ is compiled from source via `duckdb-rs`).
+
+### Configuration
+
+```elixir
+# config/config.exs
+config :explorer, default_backend: ExplorerDuckDB
+
+# Optional: default database path (default: :memory)
+config :explorer_duckdb_backend, database: "/path/to/db.duckdb"
+
+# Optional: auto-start a shared connection under supervision
+config :explorer_duckdb_backend, connection: [path: "analytics.duckdb", name: :analytics]
+```
 
 ## Usage
 
@@ -34,10 +54,8 @@ Requires Rust toolchain for compilation (the DuckDB C++ library is compiled from
 require Explorer.DataFrame, as: DataFrame
 require Explorer.Series, as: Series
 
-# Set as default backend
 Explorer.Backend.put(ExplorerDuckDB)
 
-# Use Explorer as normal
 df = DataFrame.new(name: ["Alice", "Bob", "Carol"], score: [85, 92, 78])
 
 df
@@ -49,6 +67,9 @@ df
 ### Connecting to databases
 
 ```elixir
+# In-memory (default)
+ExplorerDuckDB.open(:memory)
+
 # File-based (persisted to disk)
 ExplorerDuckDB.open("analytics.duckdb")
 
@@ -67,6 +88,12 @@ df = DataFrame.from_parquet!("s3://my-bucket/data.parquet")
 
 # MotherDuck (cloud)
 ExplorerDuckDB.open("md:my_database?motherduck_token=<token>")
+
+# Automatic cleanup
+ExplorerDuckDB.with_db("analytics.duckdb", fn ->
+  df = DataFrame.from_csv!("data.csv")
+  DataFrame.to_parquet(df, "output.parquet")
+end)
 ```
 
 ### Shared connections
@@ -75,11 +102,12 @@ ExplorerDuckDB.open("md:my_database?motherduck_token=<token>")
 # Start a shared connection (GenServer)
 {:ok, conn} = ExplorerDuckDB.Connection.start_link(path: "shared.duckdb", name: :analytics)
 
-# Use from any process
+# Use from any process -- connection monitors client processes
+# and auto-cleans orphaned temp tables on process exit
 ExplorerDuckDB.Connection.use(:analytics)
 df = DataFrame.from_csv!("data.csv")
 
-# Or query directly
+# Or query directly through the connection
 {:ok, df} = ExplorerDuckDB.Connection.query(:analytics, "SELECT * FROM my_table")
 ```
 
@@ -91,7 +119,8 @@ df = DataFrame.new(sales: [100, 200, 300], region: ["N", "S", "N"])
 DataFrame.sql(df, """
   SELECT region,
          SUM(sales) AS total,
-         AVG(sales) AS average
+         AVG(sales) AS average,
+         RANK() OVER (ORDER BY SUM(sales) DESC) AS rank
   FROM tbl
   GROUP BY region
 """, table_name: "tbl")
@@ -99,29 +128,30 @@ DataFrame.sql(df, """
 
 ## What's implemented
 
-**DataFrame** (55 of 66 callbacks):
-- IO: CSV, Parquet, NDJSON (read/write/dump/load)
+**DataFrame** (54 of 66 callbacks):
+- IO: CSV, Parquet, NDJSON (read/write/dump/load with options: delimiter, max_rows, columns, skip_rows)
 - Table verbs: filter, mutate, sort, select, distinct, rename, head, tail, slice, drop_nil, put, nil_count
 - Multi-table: join (inner/left/right/outer/cross), concat_rows, concat_columns
 - Reshape: pivot_wider, pivot_longer, transpose, explode, unnest, dummies
 - Stats: correlation, covariance, sample
 - Groups: group_by + summarise
 - SQL: raw SQL passthrough
-- Not implemented: IPC format (DuckDB doesn't natively support Arrow IPC files), ADBC/from_query
+- ADBC: from_query via Arrow C Stream Interface
+- Not implemented: IPC format (10 callbacks -- DuckDB doesn't natively support Arrow IPC files), owner_import/export (2 callbacks)
 
-**Series** (134 of 146 callbacks):
-- Types: integers (s8-s64, u8-u64), floats (f32/f64), boolean, string, date, datetime, binary
+**Series** (146 of 146 callbacks):
+- Types: integers (s8-s64, u8-u64), floats (f32/f64), boolean, string, date, datetime, duration, binary, category, decimal
 - Math: add, subtract, multiply, divide, pow, log, exp, abs, clip
 - Trig: sin, cos, tan, asin, acos, atan, degrees, radians
-- Comparison: equal, not_equal, greater, less, etc.
-- Aggregation: sum, mean, min, max, median, mode, variance, stddev, quantile, product, skew, correlation, covariance
-- String: contains, upcase, downcase, replace, strip, substring, split, regex ops
-- Date/time: year, month, day_of_week, hour, minute, second, etc.
+- Comparison: equal, not_equal, greater, less, greater_equal, less_equal, all_equal, binary_and/or/in
+- Aggregation: sum, mean, min, max, median, mode, variance, stddev, quantile, product, skew, correlation, covariance, argmin, argmax, nil_count, n_distinct
+- String: contains, upcase, downcase, replace, strip/lstrip/rstrip, substring, split, split_into, json_decode, json_path_match, count_matches, re_contains, re_replace, re_count_matches, re_scan, re_named_captures
+- Date/time: year, month, day_of_week, day_of_year, week_of_year, hour, minute, second, strptime, strftime
 - Window: cumulative_sum/min/max/product/count, rolling_sum/min/max/mean/median/stddev
 - EWM: ewm_mean, ewm_variance, ewm_standard_deviation
 - Missing: fill_missing (forward/backward/min/max/mean/value)
-- Sort: sort, argsort, reverse, distinct, n_distinct, frequencies
-- Other: cast, from_binary, to_iovec, sample, rank, peaks, NaN/Infinity support
+- Sort: sort, argsort, reverse, distinct, unordered_distinct, n_distinct, frequencies
+- Other: cast, categorise, categories, from_binary, to_iovec, sample, rank, peaks, cut, qcut, select, shift, coalesce, concat, format, mask, at_every, binary_in, transform, NaN/Infinity support
 
 ## Running tests
 
@@ -129,7 +159,7 @@ DataFrame.sql(df, """
 mix test
 ```
 
-260 tests including property-based tests, adversarial edge cases, lazy/eager boundary tests, concurrency tests, and IO round-trip tests.
+329 tests (20 property-based) including adversarial edge cases, lazy/eager boundary tests, concurrency tests, IO round-trip tests, and Arrow vtab data type coverage.
 
 ## License
 
