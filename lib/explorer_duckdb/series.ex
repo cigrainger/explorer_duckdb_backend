@@ -9,9 +9,14 @@ defmodule ExplorerDuckDB.Series do
 
   import Kernel, except: [is_nil: 1]
 
-  defstruct resource: nil
+  defstruct resource: nil, pending_sql: nil, source_table: nil, source_db: nil
 
-  @type t :: %__MODULE__{resource: reference()}
+  @type t :: %__MODULE__{
+          resource: reference() | nil,
+          pending_sql: String.t() | nil,
+          source_table: String.t() | nil,
+          source_db: reference() | nil
+        }
 
   # Used by DataFrame.from_series to create a series without wrapping in Explorer.Series
   def from_list_for_df(list, dtype, name) do
@@ -58,6 +63,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def to_list(series) do
+    series = ensure_materialized(series)
+
     case Native.s_to_list(series.data.resource) do
       {:ok, list} -> list
       list when is_list(list) -> list
@@ -90,7 +97,9 @@ defmodule ExplorerDuckDB.Series do
   @impl true
   def cast(series, dtype) do
     duckdb_type = ExplorerDuckDB.DataFrame.explorer_dtype_to_duckdb_sql(dtype)
-    sql_transform(series, "CAST(\"value\" AS #{duckdb_type})")
+    result = sql_transform(series, "CAST(\"value\" AS #{duckdb_type})")
+    # Update dtype since cast changes it
+    %{result | dtype: dtype}
   end
 
   @impl true
@@ -127,6 +136,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def size(series) do
+    series = ensure_materialized(series)
+
     case Native.s_size(series.data.resource) do
       {:ok, n} -> n
       n when is_integer(n) -> n
@@ -135,6 +146,7 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def inspect(series, opts) do
+    series = ensure_materialized(series)
     n_rows = size(series)
     Explorer.Backend.Series.inspect(series, "DuckDB", n_rows, opts)
   end
@@ -197,6 +209,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def at(series, idx) do
+    series = ensure_materialized(series)
+
     case Native.s_at(series.data.resource, idx) do
       {:ok, val} -> val
       val -> val
@@ -245,6 +259,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def slice(series, offset, length) do
+    series = ensure_materialized(series)
+
     case Native.s_slice(series.data.resource, offset, length) do
       {:ok, ref} -> Shared.create_series(ref)
       ref when is_reference(ref) -> Shared.create_series(ref)
@@ -664,6 +680,7 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def sort(series, descending?, _maintain_order?, _multithreaded?, nulls_last?) do
+    series = ensure_materialized(series)
     db = Shared.get_db()
 
     case Native.s_sort(db, series.data.resource, descending?, nulls_last?) do
@@ -698,6 +715,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def reverse(series) do
+    series = ensure_materialized(series)
+
     case Native.s_reverse(series.data.resource) do
       {:ok, ref} -> Shared.create_series(ref)
       ref when is_reference(ref) -> Shared.create_series(ref)
@@ -888,6 +907,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def is_nil(series) do
+    series = ensure_materialized(series)
+
     case Native.s_is_nil(series.data.resource) do
       {:ok, ref} -> Shared.create_series(ref)
       ref when is_reference(ref) -> Shared.create_series(ref)
@@ -896,6 +917,8 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def is_not_nil(series) do
+    series = ensure_materialized(series)
+
     case Native.s_is_not_nil(series.data.resource) do
       {:ok, ref} -> Shared.create_series(ref)
       ref when is_reference(ref) -> Shared.create_series(ref)
@@ -1136,6 +1159,7 @@ defmodule ExplorerDuckDB.Series do
   # ============================================================
 
   defp scalar_agg(series, agg_fn) do
+    series = ensure_materialized(series)
     db = Shared.get_db()
 
     case Native.s_aggregate_scalar(db, series.data.resource, agg_fn) do
@@ -1162,15 +1186,48 @@ defmodule ExplorerDuckDB.Series do
     end
   end
 
-  defp sql_transform(series, sql_expr) do
-    db = Shared.get_db()
-    table = create_temp_table(db, series)
+  defp sql_transform(%Series{} = series, sql_expr) do
+    backend = series.data
 
+    case backend do
+      %__MODULE__{pending_sql: nil, resource: resource} when is_reference(resource) ->
+        # First transform on a materialized series -- create temp table and go lazy
+        db = Shared.get_db()
+        table = create_temp_table(db, series)
+        lazy_backend = %__MODULE__{
+          resource: nil,
+          pending_sql: sql_expr,
+          source_table: table,
+          source_db: db
+        }
+        %{series | data: lazy_backend}
+
+      %__MODULE__{pending_sql: prev_sql} when is_binary(prev_sql) ->
+        # Chain on existing lazy -- compose the SQL expression
+        # Replace "value" references in the new expr with the previous expression
+        composed = String.replace(sql_expr, "\"value\"", "(#{prev_sql})")
+        lazy_backend = %{backend | pending_sql: composed}
+        %{series | data: lazy_backend}
+    end
+  end
+
+  # Materialize a lazy series by executing its pending SQL
+  defp materialize(%Series{data: %__MODULE__{pending_sql: nil}} = series), do: series
+
+  defp materialize(%Series{data: %__MODULE__{pending_sql: sql, source_table: table, source_db: db}}) do
     try do
-      query_series(db, "SELECT #{sql_expr} AS \"value\" FROM #{table} ORDER BY __rowid")
+      result = query_series(db, "SELECT #{sql} AS \"value\" FROM #{table} ORDER BY __rowid")
+      result
     after
       cleanup(db, table)
     end
+  end
+
+  # Ensure a series is materialized before accessing data
+  defp ensure_materialized(%Series{data: %__MODULE__{pending_sql: nil}} = series), do: series
+
+  defp ensure_materialized(%Series{} = series) do
+    materialize(series)
   end
 
   defp query_series(db, sql) do
@@ -1193,6 +1250,7 @@ defmodule ExplorerDuckDB.Series do
   end
 
   defp create_temp_table(db, %Series{} = series) do
+    series = ensure_materialized(series)
     pid_hash = :erlang.phash2(self())
     table_name = "__explorer_s_#{pid_hash}_#{System.unique_integer([:positive])}"
 
@@ -1294,16 +1352,37 @@ defmodule ExplorerDuckDB.Series do
   end
 
   defp binary_series_op(%Series{} = left, %Series{} = right, op) do
-    db = Shared.get_db()
+    left = ensure_materialized(left)
+    right = ensure_materialized(right)
 
-    case Native.s_binary_op(db, left.data.resource, right.data.resource, op) do
-      {:ok, ref} -> Shared.create_series(ref)
-      ref when is_reference(ref) -> Shared.create_series(ref)
-      {:error, error} -> raise RuntimeError, to_string(error)
+    left_size = size(left)
+    right_size = size(right)
+
+    cond do
+      # Broadcast: right is scalar (size 1), use scalar path
+      right_size == 1 and left_size > 1 ->
+        scalar = at(right, 0)
+        binary_series_op(left, scalar, op)
+
+      # Broadcast: left is scalar (size 1), use scalar path
+      left_size == 1 and right_size > 1 ->
+        scalar = at(left, 0)
+        binary_series_op(scalar, right, op)
+
+      # Same size or both scalars: positional join
+      true ->
+        db = Shared.get_db()
+
+        case Native.s_binary_op(db, left.data.resource, right.data.resource, op) do
+          {:ok, ref} -> Shared.create_series(ref)
+          ref when is_reference(ref) -> Shared.create_series(ref)
+          {:error, error} -> raise RuntimeError, to_string(error)
+        end
     end
   end
 
   defp binary_series_op(%Series{} = left, scalar, op) when is_number(scalar) do
+    left = ensure_materialized(left)
     db = Shared.get_db()
 
     result =

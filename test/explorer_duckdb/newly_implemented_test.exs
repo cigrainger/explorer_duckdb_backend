@@ -232,6 +232,67 @@ defmodule ExplorerDuckDB.NewlyImplementedTest do
   end
 
   # ============================================================
+  # Series SQL composition
+  # ============================================================
+
+  describe "series SQL composition" do
+    test "chained transforms produce correct results" do
+      s = Series.from_list([-5, -3, 0, 3, 5])
+
+      result =
+        s
+        |> Series.abs()
+        |> Series.cast({:f, 64})
+        |> Series.multiply(2)
+
+      assert Series.to_list(result) == [10.0, 6.0, 0.0, 6.0, 10.0]
+    end
+
+    test "three chained sql transforms" do
+      s = Series.from_list([1.0, 2.0, 3.0, 4.0, 5.0])
+
+      result =
+        s
+        |> Series.log()
+        |> Series.exp()
+        |> Series.round(1)
+
+      # log then exp should be identity (within rounding)
+      assert Series.to_list(result) == [1.0, 2.0, 3.0, 4.0, 5.0]
+    end
+
+    test "lazy series materializes on to_list" do
+      s = Series.from_list([1.0, 4.0, 9.0, 16.0])
+      lazy = Series.abs(s)
+
+      # Should be lazy at this point
+      assert lazy.data.pending_sql != nil
+
+      # Materializes on to_list
+      assert Series.to_list(lazy) == [1.0, 4.0, 9.0, 16.0]
+    end
+
+    test "lazy series materializes on aggregation" do
+      s = Series.from_list([-1, -2, -3, -4, -5])
+      abs_s = Series.abs(s)
+
+      # Aggregation should force materialization
+      assert Series.sum(abs_s) == 15
+    end
+
+    test "composed chain with round and clip" do
+      s = Series.from_list([0.123, 5.678, 10.999, 15.001, 20.5])
+
+      result =
+        s
+        |> Series.round(0)
+        |> Series.clip(1, 15)
+
+      assert Series.to_list(result) == [1.0, 6.0, 11.0, 15.0, 15.0]
+    end
+  end
+
+  # ============================================================
   # Series ordering guarantee
   # ============================================================
 
