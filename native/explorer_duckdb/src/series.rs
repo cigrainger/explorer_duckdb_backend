@@ -452,7 +452,7 @@ fn s_aggregate_scalar<'a>(
 ) -> Result<Term<'a>, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -483,7 +483,7 @@ fn s_binary_op(
 ) -> Result<ExDuckDBSeries, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -534,7 +534,7 @@ fn s_binary_op_scalar_rhs_f64(
 ) -> Result<ExDuckDBSeries, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -570,7 +570,7 @@ fn s_binary_op_scalar_rhs_i64(
 ) -> Result<ExDuckDBSeries, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -606,7 +606,7 @@ fn s_sort(
 ) -> Result<ExDuckDBSeries, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 

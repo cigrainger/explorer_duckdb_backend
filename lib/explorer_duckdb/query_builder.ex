@@ -120,6 +120,10 @@ defmodule ExplorerDuckDB.QueryBuilder do
     end
   end
 
+  defp apply_op({:join, right_source, how, on_pairs, select_cols, _ref}, prev) do
+    apply_op({:join, right_source, how, on_pairs, select_cols}, prev)
+  end
+
   defp apply_op({:join, right_source, how, on_pairs, select_cols}, prev) do
     join_str =
       case how do

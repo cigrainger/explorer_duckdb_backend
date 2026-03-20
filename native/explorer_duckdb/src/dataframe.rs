@@ -2,15 +2,22 @@ use duckdb::arrow::array::RecordBatch;
 use duckdb::arrow::datatypes::SchemaRef;
 use rustler::{Encoder, Env, Error as NifError, Resource, ResourceArc, Term};
 
-use crate::database::ExDuckDB;
+use crate::database::{ExDuckDB, ExDuckDBRef};
 use crate::error::DuckDBExError;
 use crate::series::ExDuckDBSeries;
 use crate::types::arrow_dtype_to_explorer;
 
+use std::sync::Mutex;
+
+/// Cached temp table: (table_name, connection_id, connection_ref_for_drop)
+type CachedTable = (String, u64, ResourceArc<ExDuckDBRef>);
+
 /// Holds a materialized DataFrame as Arrow RecordBatches.
+/// Includes a connection-scoped temp table cache with auto-cleanup on Drop.
 pub struct ExDuckDBDataFrameRef {
     pub batches: Vec<RecordBatch>,
     pub schema: SchemaRef,
+    cached_table: Mutex<Option<CachedTable>>,
 }
 
 // Arrow RecordBatches are immutable; safe across unwind boundaries.
@@ -19,6 +26,18 @@ impl std::panic::RefUnwindSafe for ExDuckDBDataFrameRef {}
 #[rustler::resource_impl]
 impl Resource for ExDuckDBDataFrameRef {}
 
+impl Drop for ExDuckDBDataFrameRef {
+    fn drop(&mut self) {
+        if let Ok(guard) = self.cached_table.lock() {
+            if let Some((ref table_name, _, ref db_ref)) = *guard {
+                if let Ok(conn) = db_ref.conn.lock() {
+                    let _ = conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"));
+                }
+            }
+        }
+    }
+}
+
 pub struct ExDuckDBDataFrame {
     pub resource: ResourceArc<ExDuckDBDataFrameRef>,
 }
@@ -26,7 +45,11 @@ pub struct ExDuckDBDataFrame {
 impl ExDuckDBDataFrame {
     pub fn new(batches: Vec<RecordBatch>, schema: SchemaRef) -> Self {
         Self {
-            resource: ResourceArc::new(ExDuckDBDataFrameRef { batches, schema }),
+            resource: ResourceArc::new(ExDuckDBDataFrameRef {
+                batches,
+                schema,
+                cached_table: Mutex::new(None),
+            }),
         }
     }
 }
@@ -49,7 +72,7 @@ impl<'a> rustler::Decoder<'a> for ExDuckDBDataFrame {
 fn df_query(db: ExDuckDB, sql: String) -> Result<ExDuckDBDataFrame, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -154,7 +177,7 @@ fn df_to_csv(db: ExDuckDB, df: ExDuckDBDataFrame, path: String) -> Result<(), Ni
     );
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
     conn.execute_batch(&sql).map_err(DuckDBExError::DuckDB)?;
@@ -173,7 +196,7 @@ fn df_to_parquet(db: ExDuckDB, df: ExDuckDBDataFrame, path: String) -> Result<()
     );
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
     conn.execute_batch(&sql).map_err(DuckDBExError::DuckDB)?;
@@ -207,12 +230,42 @@ fn df_to_rows<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<Term<'a>, NifEr
     Ok(rows.encode(env))
 }
 
-/// Register a DataFrame as a refcounted temporary table.
-/// Returns {table_name, resource_ref} -- the table is automatically dropped
-/// when the resource_ref is garbage collected.
+/// Ensure a DataFrame has a registered temp table. Returns the table name.
+/// If already cached for this connection, returns instantly.
+/// The table is auto-dropped when the DataFrame NIF resource is GC'd.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_ensure_table(db: ExDuckDB, df: ExDuckDBDataFrame) -> Result<String, NifError> {
+    let conn_id = db.conn_id();
+
+    // Check cache -- only reuse if same connection
+    if let Ok(guard) = df.resource.cached_table.lock() {
+        if let Some((ref name, ref cached_conn_id, _)) = *guard {
+            if *cached_conn_id == conn_id {
+                return Ok(name.clone());
+            }
+        }
+    }
+
+    // Generate table name scoped to connection
+    let table_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let table_name = format!("__explorer_c{conn_id}_{table_id}");
+
+    df_register_table_impl(&db, &df, &table_name)?;
+
+    // Cache it
+    if let Ok(mut guard) = df.resource.cached_table.lock() {
+        *guard = Some((table_name.clone(), conn_id, db.resource.clone()));
+    }
+
+    Ok(table_name)
+}
+
+/// Register a DataFrame as a refcounted temporary table (legacy).
 #[rustler::nif(schedule = "DirtyCpu")]
 fn df_register_table_rc(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<crate::temp_table::ExTempTable, NifError> {
-    // Delegate to the existing registration logic
     df_register_table_impl(&db, &df, &table_name)?;
     Ok(crate::temp_table::ExTempTable::new(table_name, db.resource.clone()))
 }
@@ -232,7 +285,7 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
 
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -242,9 +295,13 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
         .map_err(DuckDBExError::DuckDB)?;
 
+    // Check if schema already has __rowid (from previous registration)
+    let has_rowid = schema.fields().iter().any(|f| f.name() == "__rowid");
+    let rowid_prefix = if has_rowid { "" } else { "ROW_NUMBER() OVER () - 1 AS __rowid, " };
+
     if df.resource.batches.is_empty() {
         // Empty -- create table from schema only
-        let mut col_defs: Vec<String> = vec!["__rowid BIGINT".to_string()];
+        let mut col_defs: Vec<String> = if has_rowid { vec![] } else { vec!["__rowid BIGINT".to_string()] };
         for field in schema.fields() {
             col_defs.push(format!("\"{}\" {}", field.name(), arrow_type_to_duckdb_sql(field.data_type())));
         }
@@ -277,7 +334,7 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
         let params = arrow_recordbatch_to_query_params(combined);
         let sql = format!(
             "CREATE TEMPORARY TABLE {table_name} AS \
-             SELECT ROW_NUMBER() OVER () - 1 AS __rowid, * FROM arrow($1, $2)"
+             SELECT {rowid_prefix}* FROM arrow($1, $2)"
         );
         conn.prepare(&sql)
             .map_err(DuckDBExError::DuckDB)?
@@ -309,7 +366,7 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
         let params = arrow_recordbatch_to_query_params(first_chunk);
         let sql = format!(
             "CREATE TEMPORARY TABLE {table_name} AS \
-             SELECT ROW_NUMBER() OVER () - 1 AS __rowid, * FROM arrow($1, $2)"
+             SELECT {rowid_prefix}* FROM arrow($1, $2)"
         );
         conn.prepare(&sql)
             .map_err(DuckDBExError::DuckDB)?
@@ -323,16 +380,20 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
             let chunk = combined.slice(offset, len);
             let params = arrow_recordbatch_to_query_params(chunk);
 
-            // Build column list for INSERT (excluding __rowid, we'll add it)
             let col_names: Vec<String> = schema.fields().iter()
+                .filter(|f| f.name() != "__rowid")
                 .map(|f| format!("\"{}\"", f.name()))
                 .collect();
 
-            let insert_sql = format!(
-                "INSERT INTO {table_name} SELECT {} + __rowid AS __rowid, {} FROM arrow($1, $2)",
-                offset,
-                col_names.join(", ")
-            );
+            let insert_sql = if has_rowid {
+                format!("INSERT INTO {table_name} SELECT * FROM arrow($1, $2)")
+            } else {
+                format!(
+                    "INSERT INTO {table_name} SELECT {} + ROW_NUMBER() OVER () - 1 AS __rowid, {} FROM arrow($1, $2)",
+                    offset,
+                    col_names.join(", ")
+                )
+            };
 
             conn.prepare(&insert_sql)
                 .map_err(DuckDBExError::DuckDB)?
@@ -351,7 +412,7 @@ fn df_register_table_impl(db: &ExDuckDB, df: &ExDuckDBDataFrame, table_name: &st
 fn df_table_names(db: ExDuckDB, table_name: String) -> Result<Vec<String>, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -391,7 +452,7 @@ fn df_register_table_arrow(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: Stri
 
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -441,7 +502,7 @@ fn df_register_table_arrow(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: Stri
 fn df_query_inner(db: &ExDuckDB, sql: &str) -> Result<ExDuckDBDataFrame, NifError> {
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
@@ -466,7 +527,7 @@ fn register_temp_table(db: &ExDuckDB, df: &ExDuckDBDataFrame) -> Result<String, 
 
     let conn = db
         .resource
-        .0
+        .conn
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 

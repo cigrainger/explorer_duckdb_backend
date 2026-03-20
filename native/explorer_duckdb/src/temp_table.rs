@@ -16,7 +16,7 @@ impl Resource for ExTempTableRef {}
 impl Drop for ExTempTableRef {
     fn drop(&mut self) {
         // Auto-cleanup: drop the temp table when all references are gone
-        if let Ok(conn) = self.db.0.lock() {
+        if let Ok(conn) = self.db.conn.lock() {
             let _ = conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS {}",
                 self.table_name

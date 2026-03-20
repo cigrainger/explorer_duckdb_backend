@@ -9,11 +9,14 @@ defmodule ExplorerDuckDB.LazyFrame do
   alias ExplorerDuckDB.SQLBuilder
   alias Explorer.Series
 
-  defstruct [:db, :source, operations: [], groups: []]
+  # source_ref keeps the source DataFrame's NIF resource alive so the
+  # cached temp table isn't dropped by GC before compute_to_eager runs.
+  defstruct [:db, :source, :source_ref, operations: [], groups: []]
 
   @type t :: %__MODULE__{
           db: reference(),
           source: String.t(),
+          source_ref: reference() | nil,
           operations: list(),
           groups: list()
         }
@@ -28,9 +31,14 @@ defmodule ExplorerDuckDB.LazyFrame do
 
     table_name = ExplorerDuckDB.DataFrame.register_df(db, df)
 
+    # Keep a reference to the source NIF resource so the cached temp table
+    # isn't garbage collected before we execute our query plan.
+    source_ref = df.data.resource
+
     lazy_data = %__MODULE__{
       db: db,
       source: table_name,
+      source_ref: source_ref,
       operations: [],
       groups: groups
     }
@@ -76,8 +84,9 @@ defmodule ExplorerDuckDB.LazyFrame do
 
     eager_df = Shared.create_dataframe!(result)
 
-    # Clean up source temp table
-    cleanup(db, lazy.source)
+    # Source table cleanup is handled by the NIF resource's Drop impl.
+    # The table lives as long as any reference to the DataFrame NIF resource.
+    # Don't manually drop -- it would invalidate the cache for other users.
 
     # Preserve groups if any
     if lazy.groups != [] do
@@ -484,7 +493,9 @@ defmodule ExplorerDuckDB.LazyFrame do
         %ExplorerDuckDB.DataFrame{} -> from_eager(left_df)
       end
 
-    push(left_lazy, {:join, right_table, how, on, select_cols})
+    # Keep right df's NIF resource alive so the cached table isn't GC'd
+    right_ref = right_eager.data.resource
+    push(left_lazy, {:join, right_table, how, on, select_cols, right_ref})
   end
 
   @impl true

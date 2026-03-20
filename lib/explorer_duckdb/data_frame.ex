@@ -201,7 +201,7 @@ defmodule ExplorerDuckDB.DataFrame do
   def to_ndjson(df, entry) do
     db = Shared.get_db()
     path = entry_to_path(entry)
-    table = register_df(db, df)
+    table = register_df_uncached(db, df)
     sql = "COPY #{table} TO '#{String.replace(path, "'", "''")}' (FORMAT JSON)"
     execute!(db, sql)
     cleanup_tables(db, [table])
@@ -412,7 +412,7 @@ defmodule ExplorerDuckDB.DataFrame do
   def mask(df, mask_series) do
     # mask is complex -- compute eagerly and filter in Elixir
     db = Shared.get_db()
-    table = register_df(db, df)
+    table = register_df_uncached(db, df)
     mask_table = register_series_as_table(db, mask_series)
 
     try do
@@ -480,7 +480,7 @@ defmodule ExplorerDuckDB.DataFrame do
 
   def slice(df, indices) when is_list(indices) do
     db = Shared.get_db()
-    table = register_df(db, df)
+    table = register_df_uncached(db, df)
 
     sql =
       "WITH numbered AS (SELECT *, ROW_NUMBER() OVER () - 1 AS __rn FROM #{table}) " <>
@@ -591,8 +591,22 @@ defmodule ExplorerDuckDB.DataFrame do
   # Public helpers (used by LazyFrame)
   # ============================================================
 
-  @doc false
+  @doc """
+  Register a DataFrame as a temp table with NIF-level caching.
+  The table is cached inside the DataFrame NIF resource -- repeated calls
+  with the same DataFrame + same connection return instantly.
+  The table is auto-dropped when the NIF resource is garbage collected.
+  """
   def register_df(db, df) do
+    case Native.df_ensure_table(db, df.data.resource) do
+      {:ok, table_name} -> table_name
+      table_name when is_binary(table_name) -> table_name
+      {:error, _} -> register_df_uncached(db, df)
+    end
+  end
+
+  @doc false
+  def register_df_uncached(db, df) do
     table_name = temp_name("df")
 
     case Native.df_register_table(db, df.data.resource, table_name) do
@@ -756,7 +770,7 @@ defmodule ExplorerDuckDB.DataFrame do
 
   @doc false
   def with_temp_table(db, df, fun) do
-    table = register_df(db, df)
+    table = register_df_uncached(db, df)
 
     try do
       fun.(table)
@@ -767,7 +781,7 @@ defmodule ExplorerDuckDB.DataFrame do
 
   @doc false
   def with_temp_tables(db, dfs, fun) do
-    tables = Enum.map(dfs, &register_df(db, &1))
+    tables = Enum.map(dfs, &register_df_uncached(db, &1))
 
     try do
       fun.(tables)
