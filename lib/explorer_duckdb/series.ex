@@ -454,8 +454,7 @@ defmodule ExplorerDuckDB.Series do
     t1 = create_temp_table(db, s1)
     t2 = create_temp_table(db, s2)
     sql = "SELECT CORR(a.\"value\", b.\"value\") FROM " <>
-      "(SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{t1}) a " <>
-      "JOIN (SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{t2}) b ON a.__rn = b.__rn"
+      "#{t1} a JOIN #{t2} b ON a.__rowid = b.__rowid"
     result = scalar_query(db, sql)
     cleanup(db, t1)
     cleanup(db, t2)
@@ -468,8 +467,7 @@ defmodule ExplorerDuckDB.Series do
     t1 = create_temp_table(db, s1)
     t2 = create_temp_table(db, s2)
     sql = "SELECT COVAR_SAMP(a.\"value\", b.\"value\") FROM " <>
-      "(SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{t1}) a " <>
-      "JOIN (SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{t2}) b ON a.__rn = b.__rn"
+      "#{t1} a JOIN #{t2} b ON a.__rowid = b.__rowid"
     result = scalar_query(db, sql)
     cleanup(db, t1)
     cleanup(db, t2)
@@ -874,8 +872,8 @@ defmodule ExplorerDuckDB.Series do
   @impl true
   def fill_missing_with_strategy(series, strategy) do
     case strategy do
-      :forward -> sql_window_fill(series, "LAST_VALUE(\"value\" IGNORE NULLS) OVER (ORDER BY __rn ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)")
-      :backward -> sql_window_fill(series, "FIRST_VALUE(\"value\" IGNORE NULLS) OVER (ORDER BY __rn ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)")
+      :forward -> sql_window_fill(series, "LAST_VALUE(\"value\" IGNORE NULLS) OVER (ORDER BY __rowid ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)")
+      :backward -> sql_window_fill(series, "FIRST_VALUE(\"value\" IGNORE NULLS) OVER (ORDER BY __rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)")
       :min -> fill_missing_with_value(series, min(series))
       :max -> fill_missing_with_value(series, max(series))
       :mean -> fill_missing_with_value(series, mean(series))
@@ -1016,7 +1014,7 @@ defmodule ExplorerDuckDB.Series do
   @impl true
   def count_matches(s, pattern) do
     p = String.replace(pattern, "'", "''")
-    sql_transform(s, "LENGTH(\"value\") - LENGTH(REPLACE(\"value\", '#{p}', '')) / LENGTH('#{p}')")
+    sql_transform(s, "(LENGTH(\"value\") - LENGTH(REPLACE(\"value\", '#{p}', ''))) / LENGTH('#{p}')")
   end
 
   @impl true
@@ -1169,7 +1167,7 @@ defmodule ExplorerDuckDB.Series do
     table = create_temp_table(db, series)
 
     try do
-      query_series(db, "SELECT #{sql_expr} AS \"value\" FROM #{table}")
+      query_series(db, "SELECT #{sql_expr} AS \"value\" FROM #{table} ORDER BY __rowid")
     after
       cleanup(db, table)
     end
@@ -1195,19 +1193,36 @@ defmodule ExplorerDuckDB.Series do
   end
 
   defp create_temp_table(db, %Series{} = series) do
-    table_name = "__explorer_s_#{System.unique_integer([:positive])}"
-    dtype_sql = ExplorerDuckDB.DataFrame.explorer_dtype_to_duckdb_sql(series.dtype)
-    ExplorerDuckDB.DataFrame.execute!(db, "CREATE TEMPORARY TABLE #{table_name} (\"value\" #{dtype_sql})")
+    pid_hash = :erlang.phash2(self())
+    table_name = "__explorer_s_#{pid_hash}_#{System.unique_integer([:positive])}"
 
-    values = to_list(series)
+    # Convert series to a single-column DataFrame and register via NIF
+    # This gives us __rowid for guaranteed ordering
+    df_ref = Native.s_to_dataframe(series.data.resource)
 
-    if values != [] do
-      value_converter = value_converter_for_dtype(series.dtype)
-      values_sql = Enum.map_join(values, ", ", fn v -> "(#{value_converter.(v)})" end)
-      ExplorerDuckDB.DataFrame.execute!(db, "INSERT INTO #{table_name} (\"value\") VALUES #{values_sql}")
+    case Native.df_register_table(db, df_ref, table_name) do
+      {} -> table_name
+      :ok -> table_name
+      {:ok, _} -> table_name
+      {:error, _error} ->
+        # Fallback to SQL-based insertion
+        dtype_sql = ExplorerDuckDB.DataFrame.explorer_dtype_to_duckdb_sql(series.dtype)
+        ExplorerDuckDB.DataFrame.execute!(db, "CREATE TEMPORARY TABLE #{table_name} (__rowid BIGINT, \"value\" #{dtype_sql})")
+
+        values = to_list(series)
+
+        if values != [] do
+          value_converter = value_converter_for_dtype(series.dtype)
+
+          values
+          |> Enum.with_index()
+          |> Enum.each(fn {v, idx} ->
+            ExplorerDuckDB.DataFrame.execute!(db, "INSERT INTO #{table_name} VALUES (#{idx}, #{value_converter.(v)})")
+          end)
+        end
+
+        table_name
     end
-
-    table_name
   end
 
   defp cleanup(db, table) do
@@ -1220,7 +1235,7 @@ defmodule ExplorerDuckDB.Series do
     table = create_temp_table(db, series)
 
     order = if reverse?, do: "DESC", else: "ASC"
-    sql = "SELECT #{agg_fn}(\"value\") OVER (ORDER BY __rn #{order} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS \"value\" FROM (SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{table})"
+    sql = "SELECT #{agg_fn}(\"value\") OVER (ORDER BY __rowid #{order} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS \"value\" FROM #{table}"
 
     result = query_series(db, sql)
     cleanup(db, table)
@@ -1244,7 +1259,7 @@ defmodule ExplorerDuckDB.Series do
         {window_size - 1, 0}
       end
 
-    sql = "SELECT #{agg_fn}(\"value\") OVER (ORDER BY __rn ROWS BETWEEN #{preceding} PRECEDING AND #{following} FOLLOWING) AS \"value\" FROM (SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{table})"
+    sql = "SELECT #{agg_fn}(\"value\") OVER (ORDER BY __rowid ROWS BETWEEN #{preceding} PRECEDING AND #{following} FOLLOWING) AS \"value\" FROM #{table}"
 
     result = query_series(db, sql)
     cleanup(db, table)
@@ -1254,7 +1269,7 @@ defmodule ExplorerDuckDB.Series do
   defp sql_window_fill(series, window_expr) do
     db = Shared.get_db()
     table = create_temp_table(db, series)
-    sql = "SELECT COALESCE(\"value\", #{window_expr}) AS \"value\" FROM (SELECT \"value\", ROW_NUMBER() OVER () AS __rn FROM #{table})"
+    sql = "SELECT COALESCE(\"value\", #{window_expr}) AS \"value\" FROM #{table}"
     result = query_series(db, sql)
     cleanup(db, table)
     result
