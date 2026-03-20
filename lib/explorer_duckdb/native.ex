@@ -41,6 +41,10 @@ defmodule ExplorerDuckDB.Native do
   def df_register_table_rc(_db, _df, _table_name), do: err()
   def df_ensure_table(_db, _df), do: err()
   def df_table_names(_db, _table_name), do: err()
+  def df_dump_ipc(_df), do: err()
+  def df_load_ipc(_binary), do: err()
+  def df_dump_ipc_stream(_df), do: err()
+  def df_load_ipc_stream(_binary), do: err()
 
   # Series
   def s_dtype(_series), do: err()

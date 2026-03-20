@@ -443,6 +443,96 @@ fn df_from_arrow_stream_pointer(stream_ptr: u64) -> Result<ExDuckDBDataFrame, Ni
     Ok(ExDuckDBDataFrame::new(batches, schema))
 }
 
+// ============================================================
+// Arrow IPC format support
+// ============================================================
+
+/// Serialize a DataFrame to Arrow IPC file format (random-access).
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_dump_ipc<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<rustler::Binary<'a>, NifError> {
+    use arrow::ipc::writer::FileWriter;
+
+    let mut buf = Vec::new();
+    {
+        let schema = &*df.resource.schema;
+        let mut writer = FileWriter::try_new(&mut buf, schema)
+            .map_err(|e| DuckDBExError::Other(format!("IPC write error: {e}")))?;
+
+        for batch in &df.resource.batches {
+            writer.write(batch)
+                .map_err(|e| DuckDBExError::Other(format!("IPC write error: {e}")))?;
+        }
+        writer.finish()
+            .map_err(|e| DuckDBExError::Other(format!("IPC finish error: {e}")))?;
+    }
+
+    let mut binary = rustler::OwnedBinary::new(buf.len())
+        .ok_or_else(|| DuckDBExError::Other("failed to allocate binary".to_string()))?;
+    binary.as_mut_slice().copy_from_slice(&buf);
+    Ok(rustler::Binary::from_owned(binary, env))
+}
+
+/// Deserialize a DataFrame from Arrow IPC file format.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_load_ipc(binary: rustler::Binary) -> Result<ExDuckDBDataFrame, NifError> {
+    use arrow::ipc::reader::FileReader;
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(binary.as_slice());
+    let reader = FileReader::try_new(cursor, None)
+        .map_err(|e| DuckDBExError::Other(format!("IPC read error: {e}")))?;
+
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(ExDuckDBDataFrame::new(batches, schema))
+}
+
+/// Serialize a DataFrame to Arrow IPC streaming format.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_dump_ipc_stream<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<rustler::Binary<'a>, NifError> {
+    use arrow::ipc::writer::StreamWriter;
+
+    let mut buf = Vec::new();
+    {
+        let schema = &*df.resource.schema;
+        let mut writer = StreamWriter::try_new(&mut buf, schema)
+            .map_err(|e| DuckDBExError::Other(format!("IPC stream write error: {e}")))?;
+
+        for batch in &df.resource.batches {
+            writer.write(batch)
+                .map_err(|e| DuckDBExError::Other(format!("IPC stream write error: {e}")))?;
+        }
+        writer.finish()
+            .map_err(|e| DuckDBExError::Other(format!("IPC stream finish error: {e}")))?;
+    }
+
+    let mut binary = rustler::OwnedBinary::new(buf.len())
+        .ok_or_else(|| DuckDBExError::Other("failed to allocate binary".to_string()))?;
+    binary.as_mut_slice().copy_from_slice(&buf);
+    Ok(rustler::Binary::from_owned(binary, env))
+}
+
+/// Deserialize a DataFrame from Arrow IPC streaming format.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_load_ipc_stream(binary: rustler::Binary) -> Result<ExDuckDBDataFrame, NifError> {
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(binary.as_slice());
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| DuckDBExError::Other(format!("IPC stream read error: {e}")))?;
+
+    let schema = reader.schema();
+    let batches: Vec<RecordBatch> = reader
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(ExDuckDBDataFrame::new(batches, schema))
+}
+
 /// Register a DataFrame using Arrow vtab zero-copy. May fail on certain types.
 /// Returns Ok(true) if arrow vtab worked, Ok(false) if it wasn't attempted.
 #[rustler::nif(schedule = "DirtyCpu")]

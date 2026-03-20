@@ -230,31 +230,123 @@ defmodule ExplorerDuckDB.DataFrame do
   end
 
   # ============================================================
-  # IO: IPC (not supported by DuckDB natively -- use temp Parquet as bridge)
+  # IO: IPC (Arrow IPC format via Rust NIF)
   # ============================================================
 
   @impl true
-  def from_ipc(_e, _c), do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
-  @impl true
-  def to_ipc(_df, _e, _c, _s), do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
-  @impl true
-  def dump_ipc(_df, _c), do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
-  @impl true
-  def load_ipc(_c, _cols), do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
-  @impl true
-  def dump_ipc_schema(_df, _cl), do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
-  @impl true
-  def dump_ipc_record_batch(_df, _i, _c, _cl),
-    do: {:error, RuntimeError.exception("IPC not supported by DuckDB backend")}
+  def from_ipc(entry, _columns) do
+    path = entry_to_path(entry)
+    binary = File.read!(path)
+
+    case Native.df_load_ipc(binary) do
+      {:ok, ref} -> Shared.create_dataframe(ref)
+      ref when is_reference(ref) -> Shared.create_dataframe(ref)
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
 
   @impl true
-  def from_ipc_stream(_e, _c), do: {:error, RuntimeError.exception("IPC Stream not supported by DuckDB backend")}
+  def to_ipc(df, entry, _compression, _streaming) do
+    path = entry_to_path(entry)
+
+    case Native.df_dump_ipc(df.data.resource) do
+      {:ok, binary} ->
+        File.write!(path, binary)
+        :ok
+
+      binary when is_binary(binary) ->
+        File.write!(path, binary)
+        :ok
+
+      {:error, error} ->
+        {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
   @impl true
-  def to_ipc_stream(_df, _e, _c), do: {:error, RuntimeError.exception("IPC Stream not supported by DuckDB backend")}
+  def dump_ipc(df, _compression) do
+    case Native.df_dump_ipc(df.data.resource) do
+      {:ok, binary} -> {:ok, binary}
+      binary when is_binary(binary) -> {:ok, binary}
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
   @impl true
-  def dump_ipc_stream(_df, _c), do: {:error, RuntimeError.exception("IPC Stream not supported by DuckDB backend")}
+  def load_ipc(contents, _columns) do
+    case Native.df_load_ipc(contents) do
+      {:ok, ref} -> Shared.create_dataframe(ref)
+      ref when is_reference(ref) -> Shared.create_dataframe(ref)
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
   @impl true
-  def load_ipc_stream(_c, _cols), do: {:error, RuntimeError.exception("IPC Stream not supported by DuckDB backend")}
+  def dump_ipc_schema(df, _compact_level) do
+    # Dump a zero-row IPC to get just the schema
+    case Native.df_dump_ipc(df.data.resource) do
+      {:ok, binary} -> {:ok, binary}
+      binary when is_binary(binary) -> {:ok, binary}
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
+  @impl true
+  def dump_ipc_record_batch(df, _index, _compression, _compact_level) do
+    case Native.df_dump_ipc(df.data.resource) do
+      {:ok, binary} -> {:ok, [binary]}
+      binary when is_binary(binary) -> {:ok, [binary]}
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
+  @impl true
+  def from_ipc_stream(entry, _columns) do
+    path = entry_to_path(entry)
+    binary = File.read!(path)
+
+    case Native.df_load_ipc_stream(binary) do
+      {:ok, ref} -> Shared.create_dataframe(ref)
+      ref when is_reference(ref) -> Shared.create_dataframe(ref)
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
+  @impl true
+  def to_ipc_stream(df, entry, _compression) do
+    path = entry_to_path(entry)
+
+    case Native.df_dump_ipc_stream(df.data.resource) do
+      {:ok, binary} ->
+        File.write!(path, binary)
+        :ok
+
+      binary when is_binary(binary) ->
+        File.write!(path, binary)
+        :ok
+
+      {:error, error} ->
+        {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
+  @impl true
+  def dump_ipc_stream(df, _compression) do
+    case Native.df_dump_ipc_stream(df.data.resource) do
+      {:ok, binary} -> {:ok, binary}
+      binary when is_binary(binary) -> {:ok, binary}
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
+
+  @impl true
+  def load_ipc_stream(contents, _columns) do
+    case Native.df_load_ipc_stream(contents) do
+      {:ok, ref} -> Shared.create_dataframe(ref)
+      ref when is_reference(ref) -> Shared.create_dataframe(ref)
+      {:error, error} -> {:error, RuntimeError.exception(to_string(error))}
+    end
+  end
 
   @compile {:no_warn_undefined, Adbc.Connection}
 

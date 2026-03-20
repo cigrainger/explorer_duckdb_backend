@@ -101,9 +101,6 @@ defmodule ExplorerDuckDB.LazyFrame do
     %{df | data: %{df.data | operations: [op | df.data.operations]}}
   end
 
-  defp cleanup(db, source) do
-    Native.db_execute(db, "DROP TABLE IF EXISTS #{source}")
-  end
 
   # ============================================================
   # Conversion
