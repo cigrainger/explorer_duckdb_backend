@@ -33,10 +33,21 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def from_list(list, dtype) do
-    case Shared.from_list(list, dtype) do
-      {:ok, series_ref} -> Shared.create_series(series_ref)
-      {:error, error} -> raise RuntimeError, to_string(error)
-      series_ref when is_reference(series_ref) -> Shared.create_series(series_ref)
+    series =
+      case Shared.from_list(list, dtype) do
+        {:ok, series_ref} -> Shared.create_series(series_ref)
+        {:error, error} -> raise RuntimeError, to_string(error)
+        series_ref when is_reference(series_ref) -> Shared.create_series(series_ref)
+      end
+
+    # Override dtype for types that DuckDB stores differently
+    case dtype do
+      :category -> %{series | dtype: :category}
+      :date -> %{series | dtype: :date}
+      :time -> %{series | dtype: :time}
+      {:naive_datetime, _} -> %{series | dtype: dtype}
+      {:datetime, _, _} -> %{series | dtype: dtype}
+      _ -> series
     end
   end
 
@@ -103,9 +114,9 @@ defmodule ExplorerDuckDB.Series do
   end
 
   @impl true
-  def categorise(series, categories) do
-    # Treat as a lookup: series values are indices into categories list
-    cat_list = Series.to_list(categories)
+  def categorise(series, categories_series) do
+    # Map integer indices to category string values
+    cat_list = Series.to_list(categories_series)
     values = to_list(series)
 
     result =
@@ -115,7 +126,9 @@ defmodule ExplorerDuckDB.Series do
         _ -> nil
       end)
 
-    from_list(result, :string)
+    # Return as category dtype
+    s = from_list(result, :string)
+    %{s | dtype: :category}
   end
 
   @impl true
@@ -152,7 +165,17 @@ defmodule ExplorerDuckDB.Series do
   end
 
   @impl true
-  def categories(_series), do: raise("categories not supported for DuckDB backend (no category dtype)")
+  def categories(series) do
+    # Return the unique category values as a string series
+    db = Shared.get_db()
+    table = create_temp_table(db, series)
+
+    try do
+      query_series(db, "SELECT DISTINCT \"value\" FROM #{table} WHERE \"value\" IS NOT NULL ORDER BY \"value\"")
+    after
+      cleanup(db, table)
+    end
+  end
 
   @impl true
   def owner_reference(_s), do: nil
@@ -780,36 +803,84 @@ defmodule ExplorerDuckDB.Series do
 
   @impl true
   def cut(s, bins, labels, break_point_label, category_label, _left_close, _include_breaks) do
-    values = to_list(s)
-    bins = [-1.0e308 | bins] ++ [1.0e308]
+    db = Shared.get_db()
+    table = create_temp_table(db, s)
     bp_label = break_point_label || "break_point"
     cat_label = category_label || "category"
 
-    {bps, cats} =
-      values
-      |> Enum.map(fn
-        nil -> {nil, nil}
-        val ->
-          idx = Enum.find_index(bins, fn b -> val <= b end) || length(bins)
-          idx = max(idx - 1, 0)
-          label = if labels, do: Enum.at(labels, idx, "unknown"), else: "(#{Enum.at(bins, idx)}, #{Enum.at(bins, idx + 1)}]"
-          {val, label}
-      end)
-      |> Enum.unzip()
+    try do
+      # Build CASE expression for binning
+      all_bins = [-1.0e308 | bins] ++ [1.0e308]
+      n_bins = length(all_bins) - 1
 
-    bp_series = from_list(bps, {:f, 64})
-    cat_series = from_list(cats, :string)
-    Explorer.DataFrame.new([{bp_label, bp_series}, {cat_label, cat_series}])
+      case_parts =
+        for i <- 0..(n_bins - 1) do
+          lo = Enum.at(all_bins, i)
+          hi = Enum.at(all_bins, i + 1)
+          label =
+            if labels do
+              Enum.at(labels, i, "unknown")
+            else
+              lo_str = if lo == -1.0e308, do: "-inf", else: "#{lo}"
+              hi_str = if hi == 1.0e308, do: "inf", else: "#{hi}"
+              "(#{lo_str}, #{hi_str}]"
+            end
+          escaped = String.replace(label, "'", "''")
+          "WHEN \"value\" > #{lo} AND \"value\" <= #{hi} THEN '#{escaped}'"
+        end
+
+      case_sql = "CASE #{Enum.join(case_parts, " ")} ELSE NULL END"
+
+      sql = "SELECT \"value\" AS \"#{bp_label}\", #{case_sql} AS \"#{cat_label}\" FROM #{table} ORDER BY __rowid"
+      result =
+        case Native.df_query(db, sql) do
+          {:ok, ref} -> Shared.create_dataframe!(ref)
+          ref when is_reference(ref) -> Shared.create_dataframe!(ref)
+        end
+
+      result
+    after
+      cleanup(db, table)
+    end
   end
 
   @impl true
   def qcut(s, quantiles, labels, break_point_label, category_label, _allow_duplicates, left_close, include_breaks) do
-    values = to_list(s) |> Enum.reject(&Kernel.is_nil/1) |> Enum.sort()
-    bins = Enum.map(quantiles, fn q ->
-      idx = trunc(q * (length(values) - 1))
-      Enum.at(values, idx)
-    end)
-    cut(s, bins, labels, break_point_label, category_label, left_close, include_breaks)
+    db = Shared.get_db()
+    table = create_temp_table(db, s)
+
+    try do
+      # Compute quantile values via DuckDB
+      quantile_exprs = Enum.map_join(quantiles, ", ", fn q -> "QUANTILE_CONT(\"value\", #{q})" end)
+      sql = "SELECT #{quantile_exprs} FROM #{table}"
+
+      bins =
+        case Native.df_query(db, sql) do
+          {:ok, ref} ->
+            case Native.df_to_rows(ref) do
+              {:ok, [row]} -> row |> Map.values()
+              [row] -> row |> Map.values()
+              _ -> []
+            end
+          ref when is_reference(ref) ->
+            case Native.df_to_rows(ref) do
+              {:ok, [row]} -> row |> Map.values()
+              [row] -> row |> Map.values()
+              _ -> []
+            end
+        end
+        |> Enum.reject(&Kernel.is_nil/1)
+        |> Enum.sort()
+        |> Enum.dedup()
+
+      # Reuse cut with computed bins (need to restore the series from table)
+      cleanup(db, table)
+      cut(s, bins, labels, break_point_label, category_label, left_close, include_breaks)
+    rescue
+      e ->
+        cleanup(db, table)
+        reraise e, __STACKTRACE__
+    end
   end
 
   # ============================================================
