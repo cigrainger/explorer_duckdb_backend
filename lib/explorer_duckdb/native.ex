@@ -45,6 +45,8 @@ defmodule ExplorerDuckDB.Native do
   def df_load_ipc(_binary), do: err()
   def df_dump_ipc_stream(_df), do: err()
   def df_load_ipc_stream(_binary), do: err()
+  def df_query_stream_init(_db, _sql), do: err()
+  def df_query_stream_next(_stream), do: err()
 
   # Series
   def s_dtype(_series), do: err()

@@ -177,6 +177,43 @@ defmodule ExplorerDuckDB do
   def current_db, do: Shared.get_db()
 
   @doc """
+  Execute a SQL query and stream results as a sequence of DataFrames.
+  Each element is a batch of rows (typically 2048, DuckDB's vector size).
+
+  ## Examples
+
+      ExplorerDuckDB.stream_query("SELECT * FROM large_table")
+      |> Stream.each(fn batch_df ->
+        IO.inspect(Explorer.DataFrame.n_rows(batch_df), label: "batch rows")
+      end)
+      |> Stream.run()
+  """
+  def stream_query(sql) when is_binary(sql) do
+    db = Shared.get_db()
+
+    {stream, _total_batches} =
+      case Native.df_query_stream_init(db, sql) do
+        {:ok, result} -> result
+        result when is_tuple(result) -> result
+      end
+
+    Stream.resource(
+      fn -> stream end,
+      fn stream ->
+        case Native.df_query_stream_next(stream) do
+          {:ok, ref} ->
+            df = Shared.create_dataframe!(ref)
+            {[df], stream}
+
+          :done ->
+            {:halt, stream}
+        end
+      end,
+      fn _ -> :ok end
+    )
+  end
+
+  @doc """
   Clean up all temporary tables created by this process.
   Call this when you're done with Explorer operations to free DuckDB resources.
 

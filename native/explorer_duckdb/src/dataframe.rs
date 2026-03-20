@@ -643,6 +643,87 @@ fn register_temp_table(db: &ExDuckDB, df: &ExDuckDBDataFrame) -> Result<String, 
     Ok(table_name)
 }
 
+// ============================================================
+// Streaming query results
+// ============================================================
+
+/// A streaming query result. Holds the Arrow iterator from DuckDB.
+pub struct ExQueryStreamRef {
+    batches: Mutex<Vec<RecordBatch>>,
+    schema: SchemaRef,
+    position: Mutex<usize>,
+}
+
+impl std::panic::RefUnwindSafe for ExQueryStreamRef {}
+
+#[rustler::resource_impl]
+impl Resource for ExQueryStreamRef {}
+
+pub struct ExQueryStream {
+    pub resource: ResourceArc<ExQueryStreamRef>,
+}
+
+impl Encoder for ExQueryStream {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        self.resource.encode(env)
+    }
+}
+
+impl<'a> rustler::Decoder<'a> for ExQueryStream {
+    fn decode(term: Term<'a>) -> rustler::NifResult<Self> {
+        let resource: ResourceArc<ExQueryStreamRef> = term.decode()?;
+        Ok(ExQueryStream { resource })
+    }
+}
+
+/// Start a streaming query. Returns a stream handle.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_query_stream_init(db: ExDuckDB, sql: String) -> Result<(ExQueryStream, u64), NifError> {
+    let conn = db
+        .resource
+        .conn
+        .lock()
+        .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
+
+    let mut stmt = conn.prepare(&sql).map_err(DuckDBExError::DuckDB)?;
+    let arrow_result = stmt.query_arrow([]).map_err(DuckDBExError::DuckDB)?;
+
+    let schema = arrow_result.get_schema();
+    let batches: Vec<RecordBatch> = arrow_result.collect();
+    let total = batches.len() as u64;
+
+    let stream = ExQueryStream {
+        resource: ResourceArc::new(ExQueryStreamRef {
+            batches: Mutex::new(batches),
+            schema,
+            position: Mutex::new(0),
+        }),
+    };
+
+    Ok((stream, total))
+}
+
+/// Get the next batch from a streaming query. Returns {:ok, df} or :done.
+#[rustler::nif]
+fn df_query_stream_next<'a>(env: Env<'a>, stream: ExQueryStream) -> Term<'a> {
+    let pos = {
+        let mut pos = stream.resource.position.lock().unwrap();
+        let current = *pos;
+        *pos += 1;
+        current
+    };
+
+    let batches = stream.resource.batches.lock().unwrap();
+    if pos >= batches.len() {
+        rustler::types::atom::Atom::from_str(env, "done").unwrap().encode(env)
+    } else {
+        let batch = batches[pos].clone();
+        let schema = stream.resource.schema.clone();
+        let df = ExDuckDBDataFrame::new(vec![batch], schema);
+        (rustler::types::atom::Atom::from_str(env, "ok").unwrap(), df).encode(env)
+    }
+}
+
 pub fn arrow_type_to_duckdb_sql(dt: &duckdb::arrow::datatypes::DataType) -> String {
     match dt {
         duckdb::arrow::datatypes::DataType::Boolean => "BOOLEAN".to_string(),
