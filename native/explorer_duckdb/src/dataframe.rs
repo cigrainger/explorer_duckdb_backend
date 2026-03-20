@@ -600,7 +600,7 @@ fn df_query_inner(db: &ExDuckDB, sql: &str) -> Result<ExDuckDBDataFrame, NifErro
     Ok(ExDuckDBDataFrame::new(batches, schema))
 }
 
-/// Register a DataFrame as a temporary table by inserting row by row.
+/// Register a DataFrame as a temporary table using Appender.
 /// Returns the table name.
 fn register_temp_table(db: &ExDuckDB, df: &ExDuckDBDataFrame) -> Result<String, NifError> {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -616,18 +616,11 @@ fn register_temp_table(db: &ExDuckDB, df: &ExDuckDBDataFrame) -> Result<String, 
         .lock()
         .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
 
-    // Build CREATE TABLE from schema
     let schema = &df.resource.schema;
     let col_defs: Vec<String> = schema
         .fields()
         .iter()
-        .map(|f| {
-            format!(
-                "\"{}\" {}",
-                f.name(),
-                arrow_type_to_duckdb_sql(f.data_type())
-            )
-        })
+        .map(|f| format!("\"{}\" {}", f.name(), arrow_type_to_duckdb_sql(f.data_type())))
         .collect();
 
     conn.execute_batch(&format!(
@@ -636,162 +629,18 @@ fn register_temp_table(db: &ExDuckDB, df: &ExDuckDBDataFrame) -> Result<String, 
     ))
     .map_err(DuckDBExError::DuckDB)?;
 
-    // Insert data using batched transactions
     if !df.resource.batches.is_empty() {
-        let num_cols = schema.fields().len();
-        let placeholders: Vec<String> = (1..=num_cols).map(|i| format!("${i}")).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} VALUES ({})",
-            placeholders.join(", ")
-        );
-
-        conn.execute_batch("BEGIN TRANSACTION").map_err(DuckDBExError::DuckDB)?;
-        let mut pending = 0usize;
+        let mut appender = conn.appender(&table_name)
+            .map_err(DuckDBExError::DuckDB)?;
 
         for batch in &df.resource.batches {
-            for row_idx in 0..batch.num_rows() {
-                let params = row_to_params(batch, row_idx);
-                conn.execute(&insert_sql, duckdb::params_from_iter(params.iter()))
-                    .map_err(DuckDBExError::DuckDB)?;
-                pending += 1;
-                if pending >= 1000 {
-                    conn.execute_batch("COMMIT; BEGIN TRANSACTION")
-                        .map_err(DuckDBExError::DuckDB)?;
-                    pending = 0;
-                }
-            }
+            appender.append_record_batch(batch.clone())
+                .map_err(DuckDBExError::DuckDB)?;
         }
-
-        conn.execute_batch("COMMIT").map_err(DuckDBExError::DuckDB)?;
+        appender.flush().map_err(DuckDBExError::DuckDB)?;
     }
 
     Ok(table_name)
-}
-
-/// Convert a row from a RecordBatch to a vector of DuckDB-compatible values.
-fn row_to_params(
-    batch: &RecordBatch,
-    row_idx: usize,
-) -> Vec<Box<dyn duckdb::types::ToSql>> {
-    use duckdb::arrow::array::*;
-    use duckdb::arrow::datatypes::DataType;
-
-    let mut params: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
-
-    for col_idx in 0..batch.num_columns() {
-        let col = batch.column(col_idx);
-        if col.is_null(row_idx) {
-            params.push(Box::new(None::<String>));
-        } else {
-            match col.data_type() {
-                DataType::Boolean => {
-                    let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
-                    params.push(Box::new(arr.value(row_idx)));
-                }
-                DataType::Int8 => {
-                    let arr = col.as_any().downcast_ref::<Int8Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i32));
-                }
-                DataType::Int16 => {
-                    let arr = col.as_any().downcast_ref::<Int16Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i32));
-                }
-                DataType::Int32 => {
-                    let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx)));
-                }
-                DataType::Int64 => {
-                    let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx)));
-                }
-                DataType::UInt8 => {
-                    let arr = col.as_any().downcast_ref::<UInt8Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i32));
-                }
-                DataType::UInt16 => {
-                    let arr = col.as_any().downcast_ref::<UInt16Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i32));
-                }
-                DataType::UInt32 => {
-                    let arr = col.as_any().downcast_ref::<UInt32Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i64));
-                }
-                DataType::UInt64 => {
-                    let arr = col.as_any().downcast_ref::<UInt64Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as i64));
-                }
-                DataType::Float32 => {
-                    let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx) as f64));
-                }
-                DataType::Float64 => {
-                    let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-                    params.push(Box::new(arr.value(row_idx)));
-                }
-                DataType::Utf8 => {
-                    let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                    params.push(Box::new(arr.value(row_idx).to_string()));
-                }
-                DataType::LargeUtf8 => {
-                    let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                    params.push(Box::new(arr.value(row_idx).to_string()));
-                }
-                DataType::Date32 => {
-                    // Days since epoch -> convert to string date for DuckDB
-                    let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
-                    let days = arr.value(row_idx);
-                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let date = epoch + chrono::Duration::days(days as i64);
-                    params.push(Box::new(date.format("%Y-%m-%d").to_string()));
-                }
-                DataType::Timestamp(unit, _) => {
-                    use duckdb::arrow::datatypes::TimeUnit;
-                    let val = match unit {
-                        TimeUnit::Second => {
-                            let arr = col.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-                            arr.value(row_idx) * 1_000_000
-                        }
-                        TimeUnit::Millisecond => {
-                            let arr = col.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
-                            arr.value(row_idx) * 1_000
-                        }
-                        TimeUnit::Microsecond => {
-                            let arr = col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
-                            arr.value(row_idx)
-                        }
-                        TimeUnit::Nanosecond => {
-                            let arr = col.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
-                            arr.value(row_idx) / 1_000
-                        }
-                    };
-                    // Store as microseconds since epoch
-                    let secs = val / 1_000_000;
-                    let usecs = (val % 1_000_000).unsigned_abs() as u32;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, usecs * 1000) {
-                        params.push(Box::new(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()));
-                    } else {
-                        params.push(Box::new(None::<String>));
-                    }
-                }
-                DataType::Decimal128(_, scale) => {
-                    let arr = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
-                    let raw = arr.value(row_idx);
-                    if *scale == 0 {
-                        params.push(Box::new(raw as i64));
-                    } else {
-                        let divisor = 10_f64.powi(*scale as i32);
-                        params.push(Box::new((raw as f64) / divisor));
-                    }
-                }
-                _ => {
-                    // Fallback: convert to NULL
-                    params.push(Box::new(None::<String>));
-                }
-            }
-        }
-    }
-
-    params
 }
 
 pub fn arrow_type_to_duckdb_sql(dt: &duckdb::arrow::datatypes::DataType) -> String {
