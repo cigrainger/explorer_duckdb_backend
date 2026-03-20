@@ -73,10 +73,11 @@ defmodule ExplorerDuckDB.LazyFrame do
           end
       end
 
+    eager_df = Shared.create_dataframe!(result)
+
     # Clean up source temp table
     cleanup(db, lazy.source)
 
-    eager_df = Shared.create_dataframe!(result)
     # Preserve groups if any
     if lazy.groups != [] do
       %{eager_df | groups: %{columns: lazy.groups, stable?: false}}

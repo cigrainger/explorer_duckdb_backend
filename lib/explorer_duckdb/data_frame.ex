@@ -595,18 +595,17 @@ defmodule ExplorerDuckDB.DataFrame do
   def register_df(db, df) do
     table_name = temp_name("df")
 
-    # Try the NIF-based registration first (uses parameterized queries)
     case Native.df_register_table(db, df.data.resource, table_name) do
-      {} -> track_temp_table(table_name); table_name
-      :ok -> track_temp_table(table_name); table_name
-      {:ok, _} -> track_temp_table(table_name); table_name
+      {} -> :ok
+      :ok -> :ok
+      {:ok, _} -> :ok
       {:error, _error} ->
-        # Fallback to SQL-based registration
         execute!(db, create_table_sql(df, table_name))
         insert_df_data(db, df, table_name)
-        track_temp_table(table_name)
-        table_name
     end
+
+    track_temp_table(table_name)
+    table_name
   end
 
   # ============================================================

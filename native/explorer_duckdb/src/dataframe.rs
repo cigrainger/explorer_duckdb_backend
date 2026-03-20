@@ -209,9 +209,13 @@ fn df_to_rows<'a>(env: Env<'a>, df: ExDuckDBDataFrame) -> Result<Term<'a>, NifEr
 
 /// Register a DataFrame as a named temporary table in DuckDB.
 /// Adds a __rowid column to guarantee insertion order.
-/// Uses batched parameterized inserts within transactions for performance.
+/// Uses Arrow vtab zero-copy for batches <= 2048 rows, falls back to
+/// parameterized inserts for larger datasets (ArrowVTab limitation).
 #[rustler::nif(schedule = "DirtyCpu")]
 fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<(), NifError> {
+    use duckdb::vtab::arrow::ArrowVTab;
+    use duckdb::vtab::arrow_recordbatch_to_query_params;
+
     let conn = db
         .resource
         .0
@@ -220,58 +224,109 @@ fn df_register_table(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) ->
 
     let schema = &df.resource.schema;
 
-    // Drop if exists, create with __rowid
+    // Drop if exists
     conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
         .map_err(DuckDBExError::DuckDB)?;
 
-    let mut col_defs: Vec<String> = vec!["__rowid BIGINT".to_string()];
-    for field in schema.fields() {
-        col_defs.push(format!(
-            "\"{}\" {}",
-            field.name(),
-            arrow_type_to_duckdb_sql(field.data_type())
-        ));
+    if df.resource.batches.is_empty() {
+        // Empty -- create table from schema only
+        let mut col_defs: Vec<String> = vec!["__rowid BIGINT".to_string()];
+        for field in schema.fields() {
+            col_defs.push(format!("\"{}\" {}", field.name(), arrow_type_to_duckdb_sql(field.data_type())));
+        }
+        conn.execute_batch(&format!("CREATE TEMPORARY TABLE {table_name} ({})", col_defs.join(", ")))
+            .map_err(DuckDBExError::DuckDB)?;
+        return Ok(());
     }
 
-    conn.execute_batch(&format!(
-        "CREATE TEMPORARY TABLE {table_name} ({})",
-        col_defs.join(", ")
-    ))
-    .map_err(DuckDBExError::DuckDB)?;
+    // Count total rows
+    let total_rows: usize = df.resource.batches.iter().map(|b| b.num_rows()).sum();
 
-    // Batched parameterized inserts within transactions
-    if !df.resource.batches.is_empty() {
-        let num_cols = schema.fields().len();
-        let placeholders: Vec<String> =
-            (1..=(num_cols + 1)).map(|i| format!("${i}")).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} VALUES ({})",
-            placeholders.join(", ")
+    // ArrowVTab only supports single-batch up to 2048 rows (DuckDB vector size)
+    if total_rows <= 2048 {
+        // Arrow zero-copy path
+        let _ = conn.register_table_function::<ArrowVTab>("arrow");
+
+        let all_arrays: Vec<_> = (0..schema.fields().len())
+            .map(|col_idx| {
+                let arrays: Vec<&dyn duckdb::arrow::array::Array> = df
+                    .resource.batches.iter()
+                    .map(|b| b.column(col_idx).as_ref())
+                    .collect();
+                duckdb::arrow::compute::concat(&arrays).unwrap()
+            })
+            .collect();
+
+        let combined = RecordBatch::try_new(schema.clone(), all_arrays)
+            .map_err(|e| DuckDBExError::Other(format!("concat: {e}")))?;
+
+        let params = arrow_recordbatch_to_query_params(combined);
+        let sql = format!(
+            "CREATE TEMPORARY TABLE {table_name} AS \
+             SELECT ROW_NUMBER() OVER () - 1 AS __rowid, * FROM arrow($1, $2)"
         );
+        conn.prepare(&sql)
+            .map_err(DuckDBExError::DuckDB)?
+            .execute(params)
+            .map_err(DuckDBExError::DuckDB)?;
+    } else {
+        // For >2048 rows: chunk into 2048-row Arrow vtab inserts
+        let _ = conn.register_table_function::<ArrowVTab>("arrow");
 
-        conn.execute_batch("BEGIN TRANSACTION").map_err(DuckDBExError::DuckDB)?;
-        let mut row_id: i64 = 0;
-        let mut pending = 0usize;
+        // Concatenate all batches first
+        let all_arrays: Vec<_> = (0..schema.fields().len())
+            .map(|col_idx| {
+                let arrays: Vec<&dyn duckdb::arrow::array::Array> = df
+                    .resource.batches.iter()
+                    .map(|b| b.column(col_idx).as_ref())
+                    .collect();
+                duckdb::arrow::compute::concat(&arrays).unwrap()
+            })
+            .collect();
 
-        for batch in &df.resource.batches {
-            for row_idx in 0..batch.num_rows() {
-                let mut params: Vec<Box<dyn duckdb::types::ToSql>> = Vec::new();
-                params.push(Box::new(row_id));
-                let row_params = row_to_params(batch, row_idx);
-                params.extend(row_params);
-                conn.execute(&insert_sql, duckdb::params_from_iter(params.iter()))
-                    .map_err(DuckDBExError::DuckDB)?;
-                row_id += 1;
-                pending += 1;
-                if pending >= 1000 {
-                    conn.execute_batch("COMMIT; BEGIN TRANSACTION")
-                        .map_err(DuckDBExError::DuckDB)?;
-                    pending = 0;
-                }
-            }
+        let combined = RecordBatch::try_new(schema.clone(), all_arrays)
+            .map_err(|e| DuckDBExError::Other(format!("concat: {e}")))?;
+
+        // Create the table from the first chunk
+        let chunk_size = 2048;
+        let first_chunk_len = std::cmp::min(chunk_size, total_rows);
+        let first_chunk = combined.slice(0, first_chunk_len);
+
+        let params = arrow_recordbatch_to_query_params(first_chunk);
+        let sql = format!(
+            "CREATE TEMPORARY TABLE {table_name} AS \
+             SELECT ROW_NUMBER() OVER () - 1 AS __rowid, * FROM arrow($1, $2)"
+        );
+        conn.prepare(&sql)
+            .map_err(DuckDBExError::DuckDB)?
+            .execute(params)
+            .map_err(DuckDBExError::DuckDB)?;
+
+        // Insert remaining chunks
+        let mut offset = chunk_size;
+        while offset < total_rows {
+            let len = std::cmp::min(chunk_size, total_rows - offset);
+            let chunk = combined.slice(offset, len);
+            let params = arrow_recordbatch_to_query_params(chunk);
+
+            // Build column list for INSERT (excluding __rowid, we'll add it)
+            let col_names: Vec<String> = schema.fields().iter()
+                .map(|f| format!("\"{}\"", f.name()))
+                .collect();
+
+            let insert_sql = format!(
+                "INSERT INTO {table_name} SELECT {} + __rowid AS __rowid, {} FROM arrow($1, $2)",
+                offset,
+                col_names.join(", ")
+            );
+
+            conn.prepare(&insert_sql)
+                .map_err(DuckDBExError::DuckDB)?
+                .execute(params)
+                .map_err(DuckDBExError::DuckDB)?;
+
+            offset += chunk_size;
         }
-
-        conn.execute_batch("COMMIT").map_err(DuckDBExError::DuckDB)?;
     }
 
     Ok(())
@@ -311,6 +366,60 @@ fn df_from_arrow_stream_pointer(stream_ptr: u64) -> Result<ExDuckDBDataFrame, Ni
         .collect();
 
     Ok(ExDuckDBDataFrame::new(batches, schema))
+}
+
+/// Register a DataFrame using Arrow vtab zero-copy. May fail on certain types.
+/// Returns Ok(true) if arrow vtab worked, Ok(false) if it wasn't attempted.
+#[rustler::nif(schedule = "DirtyCpu")]
+fn df_register_table_arrow(db: ExDuckDB, df: ExDuckDBDataFrame, table_name: String) -> Result<bool, NifError> {
+    use duckdb::vtab::arrow::ArrowVTab;
+    use duckdb::vtab::arrow_recordbatch_to_query_params;
+
+    let conn = db
+        .resource
+        .0
+        .lock()
+        .map_err(|e| DuckDBExError::Other(format!("lock error: {e}")))?;
+
+    let _ = conn.register_table_function::<ArrowVTab>("arrow");
+
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table_name}"))
+        .map_err(DuckDBExError::DuckDB)?;
+
+    let schema = df.resource.schema.clone();
+
+    if df.resource.batches.is_empty() {
+        return Ok(false);
+    }
+
+    // Concatenate batches
+    let all_arrays: Vec<_> = (0..schema.fields().len())
+        .map(|col_idx| {
+            let arrays: Vec<&dyn duckdb::arrow::array::Array> = df
+                .resource
+                .batches
+                .iter()
+                .map(|b| b.column(col_idx).as_ref())
+                .collect();
+            duckdb::arrow::compute::concat(&arrays).unwrap()
+        })
+        .collect();
+
+    let combined = RecordBatch::try_new(schema, all_arrays)
+        .map_err(|e| DuckDBExError::Other(format!("concat: {e}")))?;
+
+    let params = arrow_recordbatch_to_query_params(combined);
+    let sql = format!(
+        "CREATE TEMPORARY TABLE {table_name} AS \
+         SELECT ROW_NUMBER() OVER () - 1 AS __rowid, * FROM arrow($1, $2)"
+    );
+
+    conn.prepare(&sql)
+        .map_err(DuckDBExError::DuckDB)?
+        .execute(params)
+        .map_err(DuckDBExError::DuckDB)?;
+
+    Ok(true)
 }
 
 // Internal helpers
